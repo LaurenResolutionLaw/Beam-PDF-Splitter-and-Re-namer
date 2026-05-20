@@ -44,6 +44,16 @@ class ChunkRow:
     include: bool
 
 
+@dataclass
+class SplitResult:
+    source_file: str
+    pages: str
+    output_file: str
+    beam_number: str
+    method: str
+    status: str
+
+
 def inject_css() -> None:
     st.markdown(
         """
@@ -237,47 +247,78 @@ def make_unique_stem(existing: set[str], requested_stem: str, fallback: str) -> 
     return candidate
 
 
-def find_beam_number_in_text(text: str) -> str | None:
+def number_tokens(text: str) -> list[str]:
     if not text:
-        return None
+        return []
 
     normalized = text.replace(",", "")
     tokens = re.findall(r"\b\d{2,}\b", normalized)
     if tokens:
-        return tokens[-1]
+        return tokens
 
     digits_only = re.sub(r"\D", "", normalized)
     if len(digits_only) >= 2:
-        return digits_only
+        return [digits_only]
 
-    return None
+    return []
 
 
-def extract_beam_number_from_page(
-    page,
-    use_ocr: bool,
-    ocr_error_callback: Callable[[Exception], None] | None = None,
-) -> tuple[str | None, str]:
+def find_beam_number_in_text(text: str) -> str | None:
+    tokens = number_tokens(text)
+    return tokens[-1] if tokens else None
+
+
+def find_native_footer_number(page) -> str | None:
     page_rect = page.rect
-    footer_rect = fitz.Rect(0, page_rect.height * FOOTER_TOP_RATIO, page_rect.width, page_rect.height)
+    footer_y = page_rect.height * 0.74
+    candidates: list[tuple[float, float, str]] = []
 
-    text = page.get_text("text", clip=footer_rect) or ""
-    beam = find_beam_number_in_text(text)
-    if beam:
-        return beam, "native text"
+    for word in page.get_text("words"):
+        x0, y0, x1, y1, text = word[:5]
+        if y0 < footer_y:
+            continue
+        for token in number_tokens(text):
+            candidates.append((float(y1), float(x0), token))
 
-    if not use_ocr:
-        return None, "not found"
+    if not candidates:
+        text = page.get_text("text", clip=fitz.Rect(0, footer_y, page_rect.width, page_rect.height)) or ""
+        return find_beam_number_in_text(text)
 
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[-1][2]
+
+
+def find_ocr_footer_number(page, ocr_error_callback: Callable[[Exception], None] | None = None) -> tuple[str | None, str]:
     try:
         from PIL import Image, ImageOps
         import pytesseract
 
         configure_tesseract(pytesseract)
+        page_rect = page.rect
+        footer_rect = fitz.Rect(0, page_rect.height * 0.74, page_rect.width, page_rect.height)
         matrix = fitz.Matrix(3, 3)
         pixmap = page.get_pixmap(matrix=matrix, clip=footer_rect, alpha=False)
         image = Image.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples)
         image = ImageOps.autocontrast(ImageOps.grayscale(image))
+
+        data = pytesseract.image_to_data(
+            image,
+            config="--psm 6 -c tessedit_char_whitelist=0123456789",
+            output_type=pytesseract.Output.DICT,
+        )
+
+        candidates: list[tuple[float, float, str]] = []
+        for index, text in enumerate(data.get("text", [])):
+            for token in number_tokens(text):
+                top = float(data["top"][index])
+                height = float(data["height"][index])
+                left = float(data["left"][index])
+                candidates.append((top + height, left, token))
+
+        if candidates:
+            candidates.sort(key=lambda item: (item[0], item[1]))
+            return candidates[-1][2], "OCR"
+
         ocr_text = pytesseract.image_to_string(
             image,
             config="--psm 6 -c tessedit_char_whitelist=0123456789",
@@ -290,6 +331,21 @@ def extract_beam_number_from_page(
             ocr_error_callback(exc)
 
     return None, "not found"
+
+
+def extract_beam_number_from_page(
+    page,
+    use_ocr: bool,
+    ocr_error_callback: Callable[[Exception], None] | None = None,
+) -> tuple[str | None, str]:
+    beam = find_native_footer_number(page)
+    if beam:
+        return beam, "native text"
+
+    if not use_ocr:
+        return None, "not found"
+
+    return find_ocr_footer_number(page, ocr_error_callback)
 
 
 def save_page_range_to_bytes(doc, start_page: int, end_page: int) -> bytes:
@@ -452,6 +508,112 @@ def build_zip(rows: list[dict], file_bytes: dict[str, bytes]) -> tuple[bytes | N
     return output.getvalue(), []
 
 
+def split_and_rename_pdfs(uploaded_files, include_odd_final_page: bool, use_fallback_names: bool) -> tuple[bytes | None, list[dict], list[str]]:
+    logs: list[str] = []
+    rows: list[SplitResult] = []
+    output = BytesIO()
+    used_names: set[str] = set()
+    fallback_counter = 1
+    written = 0
+    use_ocr = ocr_available()
+    ocr_warning_logged = False
+
+    if not use_ocr:
+        logs.append("OCR is unavailable on the server. Native PDFs may still work, but scanned PDFs need Tesseract OCR.")
+
+    def warn_ocr_once(exc: Exception) -> None:
+        nonlocal ocr_warning_logged
+        if not ocr_warning_logged:
+            logs.append(f"OCR warning: {exc}")
+            ocr_warning_logged = True
+
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for uploaded_file in uploaded_files:
+            data = uploaded_file.getvalue()
+            source_name = Path(uploaded_file.name).name
+
+            try:
+                doc = fitz.open(stream=data, filetype="pdf")
+            except Exception as exc:
+                logs.append(f"{source_name}: could not open PDF ({exc}).")
+                continue
+
+            try:
+                page_count = doc.page_count
+                pair_page_count = page_count - (page_count % 2)
+
+                for start_page in range(0, pair_page_count, 2):
+                    end_page = start_page + 1
+                    pages = f"{start_page + 1}-{end_page + 1}"
+                    beam_number, method = extract_beam_number_from_page(doc[end_page], use_ocr, warn_ocr_once)
+                    status = "Beam number found."
+
+                    if beam_number:
+                        stem = beam_number
+                    elif use_fallback_names:
+                        stem = f"unnamed_{fallback_counter:03d}"
+                        fallback_counter += 1
+                        status = "Beam number not found; fallback name used."
+                    else:
+                        logs.append(f"{source_name} pages {pages}: beam number not found; skipped.")
+                        rows.append(
+                            SplitResult(
+                                source_file=source_name,
+                                pages=pages,
+                                output_file="",
+                                beam_number="",
+                                method="not found",
+                                status="Skipped - beam number not found.",
+                            )
+                        )
+                        continue
+
+                    unique_stem = make_unique_stem(used_names, stem, f"unnamed_{fallback_counter:03d}")
+                    output_file = f"{unique_stem}.pdf"
+                    pdf_bytes = save_page_range_to_bytes(doc, start_page, end_page)
+                    archive.writestr(output_file, pdf_bytes)
+                    written += 1
+                    rows.append(
+                        SplitResult(
+                            source_file=source_name,
+                            pages=pages,
+                            output_file=output_file,
+                            beam_number=beam_number or "",
+                            method=method,
+                            status=status,
+                        )
+                    )
+
+                if page_count % 2:
+                    last_page = page_count - 1
+                    if include_odd_final_page:
+                        stem = f"{Path(source_name).stem}_page_{page_count:03d}"
+                        unique_stem = make_unique_stem(used_names, stem, stem)
+                        output_file = f"{unique_stem}.pdf"
+                        pdf_bytes = save_page_range_to_bytes(doc, last_page, last_page)
+                        archive.writestr(output_file, pdf_bytes)
+                        written += 1
+                        rows.append(
+                            SplitResult(
+                                source_file=source_name,
+                                pages=str(page_count),
+                                output_file=output_file,
+                                beam_number="",
+                                method="odd final page",
+                                status="Included as single-page output.",
+                            )
+                        )
+                    else:
+                        logs.append(f"{source_name} page {page_count}: odd final page skipped.")
+            finally:
+                doc.close()
+
+    if written == 0:
+        return None, [asdict(row) for row in rows], logs + ["No PDF chunks were created."]
+
+    return output.getvalue(), [asdict(row) for row in rows], logs
+
+
 def render_beam_pdf_splitter() -> None:
     st.markdown(
         """
@@ -466,15 +628,9 @@ def render_beam_pdf_splitter() -> None:
     with st.expander("Processing rules", expanded=True):
         col1, col2 = st.columns(2)
         with col1:
-            odd_page_mode = st.radio(
-                "Odd final page",
-                ["Include as single-page output", "Skip odd final pages", "Review odd final pages"],
-            )
+            include_odd_final_page = st.checkbox("Include odd final page as a single-page PDF", value=False)
         with col2:
-            missing_beam_mode = st.radio(
-                "Missing beam number",
-                ["Review before download", "Use fallback names", "Skip missing beam pairs"],
-            )
+            use_fallback_names = st.checkbox("Use fallback name if beam number is not found", value=True)
 
     st.markdown('<div class="section-label">Upload PDFs</div>', unsafe_allow_html=True)
     upload_tabs = st.tabs(["Single or multiple PDF files", "Folder of PDFs"])
@@ -521,74 +677,47 @@ def render_beam_pdf_splitter() -> None:
             )
         return
 
+    expected_pairs = 0
+    for uploaded_file in uploaded_files:
+        try:
+            with fitz.open(stream=uploaded_file.getvalue(), filetype="pdf") as doc:
+                expected_pairs += doc.page_count // 2
+        except Exception:
+            pass
+
     st.markdown(
         f"""
         <div class="metric-strip">
             <div class="metric-box"><strong>{len(uploaded_files)}</strong><span>PDF upload(s)</span></div>
-            <div class="metric-box"><strong>Review</strong><span>edit names before download</span></div>
-            <div class="metric-box"><strong>ZIP</strong><span>download output</span></div>
+            <div class="metric-box"><strong>{expected_pairs}</strong><span>two-page output file(s)</span></div>
+            <div class="metric-box"><strong>ZIP</strong><span>renamed download</span></div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    if st.button("Analyze PDFs", type="primary", use_container_width=True):
-        progress = st.progress(0, text="Reading PDFs...")
-        rows, logs, file_bytes = analyze_uploads(uploaded_files, odd_page_mode, missing_beam_mode)
-        progress.progress(100, text="Analysis complete")
-        st.session_state["beam_analysis_rows"] = rows
-        st.session_state["beam_analysis_logs"] = logs
-        st.session_state["beam_file_bytes"] = file_bytes
-        st.session_state["beam_zip_bytes"] = None
+    if st.button("Split and Rename PDFs", type="primary", use_container_width=True):
+        progress = st.progress(0, text="Splitting PDFs...")
+        zip_bytes, result_rows, logs = split_and_rename_pdfs(uploaded_files, include_odd_final_page, use_fallback_names)
+        progress.progress(100, text="Finished")
+        st.session_state["beam_zip_bytes"] = zip_bytes
+        st.session_state["beam_result_rows"] = result_rows
+        st.session_state["beam_result_logs"] = logs
 
-    rows = st.session_state.get("beam_analysis_rows")
-    if not rows:
-        return
-
-    logs = st.session_state.get("beam_analysis_logs", [])
-    included_count = sum(1 for row in rows if row.get("include"))
-    issue_count = sum(1 for row in rows if row.get("issue"))
-    st.info(f"Analysis found {len(rows)} chunk row(s), with {included_count} currently selected for output.")
+    result_rows = st.session_state.get("beam_result_rows", [])
+    logs = st.session_state.get("beam_result_logs", [])
 
     if logs:
-        with st.expander("Processing log", expanded=bool(issue_count)):
+        with st.expander("Processing log", expanded=True):
             for log in logs:
                 st.write(log)
 
-    st.subheader("Review Output Names")
-    edited_rows = st.data_editor(
-        rows,
-        use_container_width=True,
-        hide_index=True,
-        num_rows="fixed",
-        disabled=["row_id", "source_file", "pages", "start_page", "end_page", "detected_beam", "method", "issue"],
-        column_config={
-            "row_id": None,
-            "start_page": None,
-            "end_page": None,
-            "include": st.column_config.CheckboxColumn("Include"),
-            "source_file": st.column_config.TextColumn("Source PDF"),
-            "pages": st.column_config.TextColumn("Pages"),
-            "detected_beam": st.column_config.TextColumn("Detected beam"),
-            "filename_stem": st.column_config.TextColumn("Output filename"),
-            "method": st.column_config.TextColumn("Method"),
-            "issue": st.column_config.TextColumn("Status"),
-        },
-        key="beam_review_editor",
-    )
-
-    create_zip = st.button("Create Download ZIP", type="primary", use_container_width=True)
-    if create_zip:
-        zip_bytes, errors = build_zip(edited_rows, st.session_state.get("beam_file_bytes", {}))
-        if errors:
-            st.error("Fix these items before downloading:")
-            for error in errors:
-                st.write(f"- {error}")
-        else:
-            st.session_state["beam_zip_bytes"] = zip_bytes
-            st.success("ZIP is ready.")
+    if result_rows:
+        st.subheader("Created Files")
+        st.dataframe(result_rows, use_container_width=True, hide_index=True)
 
     if st.session_state.get("beam_zip_bytes"):
+        st.success("Your split and renamed PDFs are ready.")
         st.download_button(
             "Download Beam Split Results",
             data=st.session_state["beam_zip_bytes"],
