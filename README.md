@@ -1,8 +1,10 @@
-# Beam-PDF-Splitter-and-Re-namer
+# Resolution Law Tools
 
-A Streamlit web app for splitting PDFs into two-page chunks and renaming each output file from the beam number found in the footer of the second page.
+A Streamlit web app for Resolution Law office tools.
 
-The app is built as an expandable **Office Tool Hub**, so more tools can be added later.
+The first tool is **Beam PDF Splitter**, which splits PDFs into two-page chunks and renames each output file from the beam number found in the footer of the second page.
+
+The app is built as an expandable toolbox, so more tools can be added later.
 
 ## Files For Streamlit
 
