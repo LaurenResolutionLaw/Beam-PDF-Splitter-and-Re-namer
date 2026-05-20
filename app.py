@@ -363,6 +363,14 @@ def file_hash(data: bytes) -> str:
     return hashlib.sha1(data).hexdigest()[:12]
 
 
+def uploaded_files_signature(uploaded_files) -> str:
+    parts: list[str] = []
+    for uploaded_file in uploaded_files:
+        data = uploaded_file.getvalue()
+        parts.append(f"{uploaded_file.name}:{len(data)}:{file_hash(data)}")
+    return "|".join(sorted(parts))
+
+
 def analyze_uploads(uploaded_files, odd_page_mode: str, missing_beam_mode: str) -> tuple[list[dict], list[str], dict[str, bytes]]:
     rows: list[ChunkRow] = []
     logs: list[str] = []
@@ -630,7 +638,7 @@ def render_beam_pdf_splitter() -> None:
         with col1:
             include_odd_final_page = st.checkbox("Include odd final page as a single-page PDF", value=False)
         with col2:
-            use_fallback_names = st.checkbox("Use fallback name if beam number is not found", value=True)
+            use_fallback_names = st.checkbox("Use fallback name if beam number is not found", value=False)
 
     st.markdown('<div class="section-label">Upload PDFs</div>', unsafe_allow_html=True)
     upload_tabs = st.tabs(["Single or multiple PDF files", "Folder of PDFs"])
@@ -652,6 +660,12 @@ def render_beam_pdf_splitter() -> None:
         )
 
     uploaded_files = list(file_uploads or []) + list(folder_uploads or [])
+    upload_signature = uploaded_files_signature(uploaded_files)
+    if st.session_state.get("beam_upload_signature") != upload_signature:
+        st.session_state["beam_upload_signature"] = upload_signature
+        st.session_state["beam_zip_bytes"] = None
+        st.session_state["beam_result_rows"] = []
+        st.session_state["beam_result_logs"] = []
 
     if not uploaded_files:
         left, right = st.columns(2)
@@ -696,13 +710,21 @@ def render_beam_pdf_splitter() -> None:
         unsafe_allow_html=True,
     )
 
+    st.caption("After upload, click the button below. The app will create one renamed PDF for each two-page pair.")
+
     if st.button("Split and Rename PDFs", type="primary", use_container_width=True):
         progress = st.progress(0, text="Splitting PDFs...")
-        zip_bytes, result_rows, logs = split_and_rename_pdfs(uploaded_files, include_odd_final_page, use_fallback_names)
-        progress.progress(100, text="Finished")
-        st.session_state["beam_zip_bytes"] = zip_bytes
-        st.session_state["beam_result_rows"] = result_rows
-        st.session_state["beam_result_logs"] = logs
+        try:
+            zip_bytes, result_rows, logs = split_and_rename_pdfs(uploaded_files, include_odd_final_page, use_fallback_names)
+            st.session_state["beam_zip_bytes"] = zip_bytes
+            st.session_state["beam_result_rows"] = result_rows
+            st.session_state["beam_result_logs"] = logs
+            progress.progress(100, text="Finished")
+        except Exception as exc:
+            st.session_state["beam_zip_bytes"] = None
+            st.session_state["beam_result_rows"] = []
+            st.session_state["beam_result_logs"] = [f"Processing failed: {exc}"]
+            progress.progress(100, text="Failed")
 
     result_rows = st.session_state.get("beam_result_rows", [])
     logs = st.session_state.get("beam_result_logs", [])
@@ -711,6 +733,8 @@ def render_beam_pdf_splitter() -> None:
         with st.expander("Processing log", expanded=True):
             for log in logs:
                 st.write(log)
+        if not st.session_state.get("beam_zip_bytes"):
+            st.error("No download was created. Check the processing log above.")
 
     if result_rows:
         st.subheader("Created Files")
