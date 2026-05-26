@@ -622,6 +622,411 @@ def split_and_rename_pdfs(uploaded_files, include_odd_final_page: bool, use_fall
     return output.getvalue(), [asdict(row) for row in rows], logs
 
 
+# ============================================================================
+# Case Folder Comparison Tool — added to Resolution Law Tools
+# Compares two folders of case-action-summary CSVs and produces an Excel
+# report (New / Modified Summary / Modified Details / No Longer In File).
+# Files are matched by case number (SM-YYYY-NNNNNN style), not by filename,
+# so renames like 10080_68-... → 10080_01-... still pair correctly.
+# Formatting-only differences (date padding, time padding, $ spacing,
+# parens-vs-minus, CSV quoting) are normalized out before comparison.
+# ============================================================================
+import csv as _csv
+import io as _io
+import re as _re
+from collections import defaultdict as _defaultdict
+
+import openpyxl as _openpyxl
+from openpyxl.styles import Font as _Font, PatternFill as _PatternFill, Alignment as _Alignment
+
+_CASE_RE  = _re.compile(r"((?:SM|CV|DV|CC|JU|TR|TP)-\d{4}-\d{4,7})", _re.IGNORECASE)
+_DATE_RE  = _re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4})$")
+_TIME_RE  = _re.compile(r"^(\d{1,2}):(\d{2}):(\d{2})\s*(AM|PM|am|pm)?$")
+_MONEY_RE = _re.compile(r"^\(\s*-?\$?\s*-?[\d,]+(?:\.\d+)?\s*\)$|^-?\$\s*-?[\d,]+(?:\.\d+)?$")
+
+_SECTIONS = [
+    "Style", "Fee Sheet", "Financial History", "Case information",
+    "Case Type", "Court Action", "Damages", "Party List",
+    "Consolidated Case Action Summary",
+]
+_SECTION_SET = {s.lower() for s in _SECTIONS}
+
+
+def _case_key(filename: str):
+    m = _CASE_RE.search(filename)
+    return m.group(1).upper() if m else None
+
+
+def _norm_cell(v) -> str:
+    if v is None:
+        return ""
+    s = str(v).replace(" ", " ").strip()
+    s = _re.sub(r"\s+", " ", s)
+    if s == "":
+        return ""
+
+    m = _DATE_RE.match(s)
+    if m:
+        mo, da, yr = m.groups()
+        return f"{int(mo):02d}/{int(da):02d}/{yr}"
+
+    m = _TIME_RE.match(s)
+    if m:
+        hh, mm, ss, ap = m.groups()
+        suf = f" {ap.upper()}" if ap else ""
+        return f"{int(hh):02d}:{mm}:{ss}{suf}"
+
+    if _MONEY_RE.match(s):
+        raw = s.replace(",", "")
+        neg = False
+        if raw.startswith("(") and raw.endswith(")"):
+            neg = True
+            raw = raw[1:-1].strip()
+        if raw.startswith("-"):
+            neg = not neg
+            raw = raw[1:].strip()
+        if raw.startswith("$"):
+            raw = raw[1:].strip()
+        if raw.startswith("-"):
+            neg = not neg
+            raw = raw[1:].strip()
+        try:
+            val = float(raw)
+            if neg:
+                val = -val
+            return f"${val:.2f}"
+        except ValueError:
+            pass
+
+    return s
+
+
+def _parse_csv_bytes(data: bytes) -> list[list[str]]:
+    try:
+        text = data.decode("utf-8-sig", errors="replace")
+    except Exception:
+        text = data.decode("latin-1", errors="replace")
+    reader = _csv.reader(_io.StringIO(text))
+    rows: list[list[str]] = []
+    for raw in reader:
+        cells = [_norm_cell(c) for c in raw]
+        while cells and cells[-1] == "":
+            cells.pop()
+        rows.append(cells)
+    return [r for r in rows if not all(c == "" for c in r)]
+
+
+def _parse_sections(rows: list[list[str]]) -> dict[str, list[list[str]]]:
+    sections: dict[str, list[list[str]]] = _defaultdict(list)
+    current = "_preamble"
+    for row in rows:
+        if not row:
+            continue
+        first = row[0]
+        if first and first.lower() in _SECTION_SET and all(c == "" for c in row[1:]):
+            for canon in _SECTIONS:
+                if canon.lower() == first.lower():
+                    current = canon
+                    break
+            continue
+        sections[current].append(row)
+    return dict(sections)
+
+
+def _row_key(row: list[str]) -> str:
+    return "\t".join(row)
+
+
+def _diff_sections(a: dict, b: dict) -> dict:
+    result = {}
+    all_secs = sorted(
+        set(a) | set(b),
+        key=lambda s: (_SECTIONS.index(s) if s in _SECTIONS else 999, s),
+    )
+    for sec in all_secs:
+        ra = a.get(sec, [])
+        rb = b.get(sec, [])
+        ka = [_row_key(r) for r in ra]
+        kb = [_row_key(r) for r in rb]
+        if ka == kb:
+            continue
+        sa, sb = set(ka), set(kb)
+        added   = [r for r in rb if _row_key(r) not in sa]
+        removed = [r for r in ra if _row_key(r) not in sb]
+        if not added and not removed:
+            continue
+        result[sec] = {"added": added, "removed": removed}
+    return result
+
+
+def _summarize(diff: dict) -> str:
+    parts = []
+    for sec, d in diff.items():
+        bits = []
+        if d["added"]:
+            bits.append(f"+{len(d['added'])}")
+        if d["removed"]:
+            bits.append(f"-{len(d['removed'])}")
+        parts.append(f"{sec} ({', '.join(bits)})")
+    return "; ".join(parts) if parts else "no real changes"
+
+
+def _group_uploads_by_case(uploaded_files) -> dict:
+    """Return {case_key: (filename, bytes)}, preferring the largest file per case."""
+    out: dict[str, tuple[str, bytes, int]] = {}
+    for uf in uploaded_files or []:
+        name = Path(uf.name).name
+        if not name.lower().endswith(".csv"):
+            continue
+        k = _case_key(name)
+        if not k:
+            continue
+        data = uf.getvalue()
+        size = len(data)
+        prev = out.get(k)
+        if (prev is None) or (size > prev[2]):
+            out[k] = (name, data, size)
+    return {k: (v[0], v[1]) for k, v in out.items()}
+
+
+def _build_excel(new_rows, mod_summary_rows, mod_detail_rows, rem_rows) -> bytes:
+    wb = _openpyxl.Workbook()
+
+    def write(name, rows, headers, color, is_first=False):
+        if is_first:
+            ws = wb.active
+            ws.title = name
+        else:
+            ws = wb.create_sheet(name)
+        ws.append(headers)
+        for col, _ in enumerate(headers, 1):
+            c = ws.cell(row=1, column=col)
+            c.font = _Font(bold=True, color="FFFFFF")
+            c.fill = _PatternFill("solid", fgColor=color)
+            c.alignment = _Alignment(vertical="center")
+        for r in rows:
+            ws.append([r.get(h, "") for h in headers])
+        for ci, h in enumerate(headers, 1):
+            samples = [len(str(h))] + [min(len(str(r.get(h, ""))), 80) for r in rows[:300]]
+            ml = max(samples) if samples else 12
+            ws.column_dimensions[_openpyxl.utils.get_column_letter(ci)].width = min(max(12, ml + 2), 80)
+        ws.freeze_panes = "A2"
+
+    write("New", new_rows, ["Case Number", "File Name (End)"], "2E7D32", is_first=True)
+    write("Modified (Summary)", mod_summary_rows,
+          ["Case Number", "File Name (Start)", "File Name (End)", "Sections Changed", "Change Summary"],
+          "1565C0")
+    write("Modified (Details)", mod_detail_rows,
+          ["Case Number", "File Name (End)", "Section", "Change Type", "Row Content"],
+          "3949AB")
+    write("No Longer In File", rem_rows, ["Case Number", "File Name (Start)"], "C62828")
+
+    buf = _io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def render_case_folder_compare() -> None:
+    st.markdown(
+        """
+        <div class="hub-hero">
+            <h1>Case Folder Comparison</h1>
+            <p>Upload a starting folder and an ending folder of case action summary CSVs.
+            The tool matches files by case number (e.g. <code>SM-2025-900752</code>), normalizes
+            away formatting noise (date padding, time padding, dollar-sign spacing, parens vs minus,
+            CSV quoting), and reports New, Modified, and No Longer In File in one Excel workbook.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("How matching works", expanded=False):
+        st.markdown(
+            "- Files match by case number, not exact filename. So `10080_68-SM-2024-901842.csv` "
+            "and `10080_01-SM-2024-901842.csv` are paired as the same case.\n"
+            "- Supported prefixes: SM, CV, DV, CC, JU, TR, TP.\n"
+            "- A case is **Modified** only when one of these sections has a real added/removed row: "
+            "Fee Sheet, Financial History, Case information, Case Type, Court Action, Damages, "
+            "Party List, Consolidated Case Action Summary, Style.\n"
+            "- Pure formatting differences are ignored."
+        )
+
+    st.markdown('<div class="section-label">1. Upload the starting folder</div>', unsafe_allow_html=True)
+    start_uploads = st.file_uploader(
+        "Starting folder (older export)",
+        type=["csv"],
+        accept_multiple_files=True,
+        help="Pick all CSVs from the starting folder, or use folder upload below.",
+        key="cfc_start_files",
+    )
+    start_folder = st.file_uploader(
+        "OR upload a whole folder",
+        type=["csv"],
+        accept_multiple_files="directory",
+        help="Use this when your browser supports folder upload.",
+        key="cfc_start_folder",
+    )
+
+    st.markdown('<div class="section-label">2. Upload the ending folder</div>', unsafe_allow_html=True)
+    end_uploads = st.file_uploader(
+        "Ending folder (newer export)",
+        type=["csv"],
+        accept_multiple_files=True,
+        help="Pick all CSVs from the ending folder, or use folder upload below.",
+        key="cfc_end_files",
+    )
+    end_folder = st.file_uploader(
+        "OR upload a whole folder",
+        type=["csv"],
+        accept_multiple_files="directory",
+        help="Use this when your browser supports folder upload.",
+        key="cfc_end_folder",
+    )
+
+    start_all = list(start_uploads or []) + list(start_folder or [])
+    end_all   = list(end_uploads or [])   + list(end_folder or [])
+
+    st.markdown(
+        f"""
+        <div class="metric-strip">
+            <div class="metric-box"><strong>{len(start_all)}</strong><span>starting CSV file(s)</span></div>
+            <div class="metric-box"><strong>{len(end_all)}</strong><span>ending CSV file(s)</span></div>
+            <div class="metric-box"><strong>Excel</strong><span>downloadable report</span></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    run = st.button("Compare folders", type="primary", use_container_width=True, disabled=not (start_all and end_all))
+    if run:
+        progress = st.progress(0, text="Reading starting folder...")
+        start_map = _group_uploads_by_case(start_all)
+        progress.progress(15, text="Reading ending folder...")
+        end_map = _group_uploads_by_case(end_all)
+
+        sk = set(start_map.keys())
+        ek = set(end_map.keys())
+        new_keys = sorted(ek - sk)
+        rem_keys = sorted(sk - ek)
+        com_keys = sorted(sk & ek)
+
+        new_rows = [{"Case Number": k, "File Name (End)": end_map[k][0]} for k in new_keys]
+        rem_rows = [{"Case Number": k, "File Name (Start)": start_map[k][0]} for k in rem_keys]
+        mod_summary_rows: list[dict] = []
+        mod_detail_rows:  list[dict] = []
+
+        total = len(com_keys)
+        for i, k in enumerate(com_keys, 1):
+            sname, sbytes = start_map[k]
+            ename, ebytes = end_map[k]
+            try:
+                sa = _parse_sections(_parse_csv_bytes(sbytes))
+                sb = _parse_sections(_parse_csv_bytes(ebytes))
+                d  = _diff_sections(sa, sb)
+                if d:
+                    mod_summary_rows.append({
+                        "Case Number": k,
+                        "File Name (Start)": sname,
+                        "File Name (End)":   ename,
+                        "Sections Changed":  ", ".join(d.keys()),
+                        "Change Summary":    _summarize(d),
+                    })
+                    for sec, dd in d.items():
+                        for row in dd["added"]:
+                            mod_detail_rows.append({
+                                "Case Number": k,
+                                "File Name (End)": ename,
+                                "Section": sec,
+                                "Change Type": "ADDED",
+                                "Row Content": " | ".join(row),
+                            })
+                        for row in dd["removed"]:
+                            mod_detail_rows.append({
+                                "Case Number": k,
+                                "File Name (End)": ename,
+                                "Section": sec,
+                                "Change Type": "REMOVED",
+                                "Row Content": " | ".join(row),
+                            })
+            except Exception as exc:
+                mod_summary_rows.append({
+                    "Case Number": k,
+                    "File Name (Start)": sname,
+                    "File Name (End)":   ename,
+                    "Sections Changed":  "ERROR",
+                    "Change Summary":    f"Read/parse error: {exc}",
+                })
+            if i % 10 == 0 or i == total:
+                pct = 15 + int(80 * i / max(total, 1))
+                progress.progress(min(pct, 95), text=f"Compared {i} of {total} common files")
+
+        progress.progress(98, text="Building Excel report...")
+        excel_bytes = _build_excel(new_rows, mod_summary_rows, mod_detail_rows, rem_rows)
+        progress.progress(100, text="Done")
+
+        st.session_state["cfc_new_rows"]     = new_rows
+        st.session_state["cfc_summary_rows"] = mod_summary_rows
+        st.session_state["cfc_detail_rows"]  = mod_detail_rows
+        st.session_state["cfc_rem_rows"]     = rem_rows
+        st.session_state["cfc_excel"]        = excel_bytes
+        st.session_state["cfc_unchanged"]    = total - len(mod_summary_rows)
+
+    if "cfc_excel" in st.session_state:
+        new_rows     = st.session_state["cfc_new_rows"]
+        mod_summary  = st.session_state["cfc_summary_rows"]
+        mod_detail   = st.session_state["cfc_detail_rows"]
+        rem_rows     = st.session_state["cfc_rem_rows"]
+        unchanged    = st.session_state["cfc_unchanged"]
+
+        st.markdown(
+            f"""
+            <div class="metric-strip">
+                <div class="metric-box"><strong>{len(new_rows)}</strong><span>new cases</span></div>
+                <div class="metric-box"><strong>{len(mod_summary)}</strong><span>modified cases ({len(mod_detail)} changes)</span></div>
+                <div class="metric-box"><strong>{len(rem_rows)}</strong><span>no longer in file</span></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            f"{unchanged} common files had no real changes after normalization "
+            "(formatting-only differences were ignored)."
+        )
+
+        st.download_button(
+            "Download Excel report",
+            data=st.session_state["cfc_excel"],
+            file_name="Case Folder Comparison.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            use_container_width=True,
+        )
+
+        tab_new, tab_mod_sum, tab_mod_det, tab_rem = st.tabs(
+            ["New", "Modified (Summary)", "Modified (Details)", "No Longer In File"]
+        )
+        with tab_new:
+            if new_rows:
+                st.dataframe(new_rows, use_container_width=True, hide_index=True)
+            else:
+                st.info("No new cases.")
+        with tab_mod_sum:
+            if mod_summary:
+                st.dataframe(mod_summary, use_container_width=True, hide_index=True)
+            else:
+                st.info("No modified cases.")
+        with tab_mod_det:
+            if mod_detail:
+                st.dataframe(mod_detail, use_container_width=True, hide_index=True)
+            else:
+                st.info("No individual changes to show.")
+        with tab_rem:
+            if rem_rows:
+                st.dataframe(rem_rows, use_container_width=True, hide_index=True)
+            else:
+                st.info("No removed cases.")
+
+
 def render_beam_pdf_splitter() -> None:
     st.markdown(
         """
@@ -830,6 +1235,13 @@ def get_tools() -> list[ToolDefinition]:
             category="PDF",
             description="Split PDFs into two-page chunks and name each output from the beam number in the footer.",
             render=render_beam_pdf_splitter,
+        ),
+        ToolDefinition(
+            tool_id="case-folder-compare",
+            name="Case Folder Comparison",
+            category="Documents",
+            description="Compare two folders of case action summary CSVs. Detect new, modified, and removed cases; ignore formatting-only differences.",
+            render=render_case_folder_compare,
         ),
     ]
 
