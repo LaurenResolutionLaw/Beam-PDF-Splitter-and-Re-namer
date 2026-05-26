@@ -623,185 +623,281 @@ def split_and_rename_pdfs(uploaded_files, include_odd_final_page: bool, use_fall
 
 
 # ============================================================================
-# Case Folder Comparison Tool — added to Resolution Law Tools
-# Compares two folders of case-action-summary CSVs and produces an Excel
-# report (New / Modified Summary / Modified Details / No Longer In File).
-# Files are matched by case number (SM-YYYY-NNNNNN style), not by filename,
-# so renames like 10080_68-... → 10080_01-... still pair correctly.
-# Formatting-only differences (date padding, time padding, $ spacing,
-# parens-vs-minus, CSV quoting) are normalized out before comparison.
+# Spreadsheet Comparison Tool — Resolution Law Tools
+# Compares two snapshots of the same tracker spreadsheet (.xlsx or .csv).
+# User picks one or more key columns (composite key supported for cases where
+# a single column isn't unique per row, e.g. Beam Number + Garnishee when one
+# case has multiple garnishments). Reports added rows, removed rows, and per-
+# cell changes after normalizing away formatting noise.
 # ============================================================================
 import csv as _csv
+import datetime as _dt
 import io as _io
 import re as _re
-from collections import defaultdict as _defaultdict
+from collections import Counter as _Counter
 
 import openpyxl as _openpyxl
 from openpyxl.styles import Font as _Font, PatternFill as _PatternFill, Alignment as _Alignment
 
-_CASE_RE  = _re.compile(r"((?:SM|CV|DV|CC|JU|TR|TP)-\d{4}-\d{4,7})", _re.IGNORECASE)
-_DATE_RE  = _re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4})$")
-_TIME_RE  = _re.compile(r"^(\d{1,2}):(\d{2}):(\d{2})\s*(AM|PM|am|pm)?$")
-_MONEY_RE = _re.compile(r"^\(\s*-?\$?\s*-?[\d,]+(?:\.\d+)?\s*\)$|^-?\$\s*-?[\d,]+(?:\.\d+)?$")
-# ASCII control chars that openpyxl rejects (and that have no business in a CSV cell anyway)
+_DATE_RE    = _re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4})$")
+_TIME_RE    = _re.compile(r"^(\d{1,2}):(\d{2}):(\d{2})\s*(AM|PM|am|pm)?$")
+_MONEY_RE   = _re.compile(r"^\(\s*-?\$?\s*-?[\d,]+(?:\.\d+)?\s*\)$|^-?\$\s*-?[\d,]+(?:\.\d+)?$")
 _ILLEGAL_RE = _re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
-_SECTIONS = [
-    "Style", "Fee Sheet", "Financial History", "Case information",
-    "Case Type", "Court Action", "Damages", "Party List",
-    "Consolidated Case Action Summary",
+_KEY_HINTS = [
+    "Beam Number", "Beam #", "Beam",
+    "Case Number", "Case #", "Case No", "Case",
+    "Account ID", "Account_ID", "Client Account ID", "Account",
+    "Matter Number", "Matter #", "Matter ID", "Matter",
+    "File Number", "File #", "File ID",
+    "ID", "Id",
 ]
-_SECTION_SET = {s.lower() for s in _SECTIONS}
 
 
-def _case_key(filename: str):
-    m = _CASE_RE.search(filename)
-    return m.group(1).upper() if m else None
-
-
-def _norm_cell(v) -> str:
+def _norm_value(v) -> str:
     if v is None:
         return ""
-    s = str(v).replace(" ", " ")
-    # Strip ASCII control chars that openpyxl refuses to write
+    if isinstance(v, _dt.datetime):
+        return f"{v.month:02d}/{v.day:02d}/{v.year}"
+    if isinstance(v, _dt.date):
+        return f"{v.month:02d}/{v.day:02d}/{v.year}"
+    if isinstance(v, bool):
+        return "TRUE" if v else "FALSE"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        if v != v:
+            return ""
+        if v.is_integer():
+            return str(int(v))
+        return f"{v:.6f}".rstrip("0").rstrip(".")
+    s = str(v).replace(" ", " ")
     s = _ILLEGAL_RE.sub("", s).strip()
     s = _re.sub(r"\s+", " ", s)
     if s == "":
         return ""
-
     m = _DATE_RE.match(s)
     if m:
         mo, da, yr = m.groups()
         return f"{int(mo):02d}/{int(da):02d}/{yr}"
-
     m = _TIME_RE.match(s)
     if m:
         hh, mm, ss, ap = m.groups()
         suf = f" {ap.upper()}" if ap else ""
         return f"{int(hh):02d}:{mm}:{ss}{suf}"
-
     if _MONEY_RE.match(s):
         raw = s.replace(",", "")
         neg = False
         if raw.startswith("(") and raw.endswith(")"):
-            neg = True
-            raw = raw[1:-1].strip()
+            neg = True; raw = raw[1:-1].strip()
         if raw.startswith("-"):
-            neg = not neg
-            raw = raw[1:].strip()
+            neg = not neg; raw = raw[1:].strip()
         if raw.startswith("$"):
             raw = raw[1:].strip()
         if raw.startswith("-"):
-            neg = not neg
-            raw = raw[1:].strip()
+            neg = not neg; raw = raw[1:].strip()
         try:
             val = float(raw)
-            if neg:
-                val = -val
+            if neg: val = -val
             return f"${val:.2f}"
         except ValueError:
             pass
-
+    try:
+        f = float(s.replace(",", ""))
+        if f.is_integer():
+            return str(int(f))
+    except (ValueError, TypeError):
+        pass
     return s
 
 
-def _parse_csv_bytes(data: bytes) -> list[list[str]]:
+def _display_value(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, _dt.datetime):
+        if v.hour == 0 and v.minute == 0 and v.second == 0:
+            return f"{v.month:02d}/{v.day:02d}/{v.year}"
+        return v.strftime("%m/%d/%Y %H:%M:%S")
+    if isinstance(v, _dt.date):
+        return f"{v.month:02d}/{v.day:02d}/{v.year}"
+    if isinstance(v, float):
+        if v != v: return ""
+        if v.is_integer(): return str(int(v))
+        return f"{v}"
+    s = str(v)
+    s = _ILLEGAL_RE.sub("", s)
+    return s
+
+
+def _detect_header_row(rows):
+    for i, r in enumerate(rows):
+        if any(c is not None and str(c).strip() != "" for c in r):
+            return i
+    return 0
+
+
+def _read_xlsx_bytes(data: bytes) -> tuple[str, list[str], list[dict]]:
+    wb = _openpyxl.load_workbook(_io.BytesIO(data), data_only=True)
+    ws = wb.active
+    all_rows = [list(r) for r in ws.iter_rows(values_only=True)]
+    if not all_rows:
+        return ws.title, [], []
+    header_idx = _detect_header_row(all_rows)
+    raw = all_rows[header_idx]
+    headers: list[str] = []
+    seen: dict[str, int] = {}
+    for c in raw:
+        h = "" if c is None else str(c).strip()
+        if h == "":
+            headers.append(""); continue
+        if h in seen:
+            seen[h] += 1
+            headers.append(f"{h} ({seen[h]})")
+        else:
+            seen[h] = 1
+            headers.append(h)
+    rows = []
+    for r in all_rows[header_idx + 1:]:
+        if all(c is None or (isinstance(c, str) and c.strip() == "") for c in r):
+            continue
+        rec = {}
+        for i, h in enumerate(headers):
+            if not h: continue
+            rec[h] = r[i] if i < len(r) else None
+        rows.append(rec)
+    return ws.title, [h for h in headers if h], rows
+
+
+def _read_csv_bytes(data: bytes) -> tuple[str, list[str], list[dict]]:
     try:
         text = data.decode("utf-8-sig", errors="replace")
     except Exception:
         text = data.decode("latin-1", errors="replace")
     reader = _csv.reader(_io.StringIO(text))
-    rows: list[list[str]] = []
-    for raw in reader:
-        cells = [_norm_cell(c) for c in raw]
-        while cells and cells[-1] == "":
-            cells.pop()
-        rows.append(cells)
-    return [r for r in rows if not all(c == "" for c in r)]
-
-
-def _parse_sections(rows: list[list[str]]) -> dict[str, list[list[str]]]:
-    sections: dict[str, list[list[str]]] = _defaultdict(list)
-    current = "_preamble"
-    for row in rows:
-        if not row:
+    all_rows = [list(r) for r in reader]
+    if not all_rows:
+        return "csv", [], []
+    header_idx = _detect_header_row(all_rows)
+    raw = all_rows[header_idx]
+    headers: list[str] = []
+    seen: dict[str, int] = {}
+    for c in raw:
+        h = "" if c is None else str(c).strip()
+        if h == "":
+            headers.append(""); continue
+        if h in seen:
+            seen[h] += 1
+            headers.append(f"{h} ({seen[h]})")
+        else:
+            seen[h] = 1
+            headers.append(h)
+    rows = []
+    for r in all_rows[header_idx + 1:]:
+        if all(c is None or str(c).strip() == "" for c in r):
             continue
-        first = row[0]
-        if first and first.lower() in _SECTION_SET and all(c == "" for c in row[1:]):
-            for canon in _SECTIONS:
-                if canon.lower() == first.lower():
-                    current = canon
-                    break
-            continue
-        sections[current].append(row)
-    return dict(sections)
+        rec = {}
+        for i, h in enumerate(headers):
+            if not h: continue
+            rec[h] = r[i] if i < len(r) else None
+        rows.append(rec)
+    return "csv", [h for h in headers if h], rows
 
 
-def _row_key(row: list[str]) -> str:
-    return "\t".join(row)
+def _read_uploaded(uploaded) -> tuple[str, list[str], list[dict]]:
+    name = uploaded.name.lower()
+    data = uploaded.getvalue()
+    if name.endswith(".csv") or name.endswith(".tsv"):
+        return _read_csv_bytes(data)
+    return _read_xlsx_bytes(data)
 
 
-def _diff_sections(a: dict, b: dict) -> dict:
-    result = {}
-    all_secs = sorted(
-        set(a) | set(b),
-        key=lambda s: (_SECTIONS.index(s) if s in _SECTIONS else 999, s),
-    )
-    for sec in all_secs:
-        ra = a.get(sec, [])
-        rb = b.get(sec, [])
-        ka = [_row_key(r) for r in ra]
-        kb = [_row_key(r) for r in rb]
-        if ka == kb:
-            continue
-        sa, sb = set(ka), set(kb)
-        added   = [r for r in rb if _row_key(r) not in sa]
-        removed = [r for r in ra if _row_key(r) not in sb]
-        if not added and not removed:
-            continue
-        result[sec] = {"added": added, "removed": removed}
-    return result
+def _suggest_key(headers_a, headers_b) -> str | None:
+    common = [h for h in headers_a if h in set(headers_b)]
+    common_lower = {h.lower(): h for h in common}
+    for hint in _KEY_HINTS:
+        if hint.lower() in common_lower:
+            return common_lower[hint.lower()]
+    return common[0] if common else None
 
 
-def _summarize(diff: dict) -> str:
-    parts = []
-    for sec, d in diff.items():
-        bits = []
-        if d["added"]:
-            bits.append(f"+{len(d['added'])}")
-        if d["removed"]:
-            bits.append(f"-{len(d['removed'])}")
-        parts.append(f"{sec} ({', '.join(bits)})")
-    return "; ".join(parts) if parts else "no real changes"
+def _row_key(rec, key_cols):
+    return "\t".join(_norm_value(rec.get(c)) for c in key_cols)
 
 
-def _group_uploads_by_case(uploaded_files) -> dict:
-    """Return {case_key: (filename, bytes)}, preferring the largest file per case."""
-    out: dict[str, tuple[str, bytes, int]] = {}
-    for uf in uploaded_files or []:
-        name = Path(uf.name).name
-        if not name.lower().endswith(".csv"):
-            continue
-        k = _case_key(name)
-        if not k:
-            continue
-        data = uf.getvalue()
-        size = len(data)
-        prev = out.get(k)
-        if (prev is None) or (size > prev[2]):
-            out[k] = (name, data, size)
-    return {k: (v[0], v[1]) for k, v in out.items()}
+def _compare_rows(rows_a, rows_b, key_cols, compare_cols):
+    """Return (new_rows, mod_summary, mod_details, rem_rows). key_cols supports composite keys."""
+    by_a: dict[str, dict] = {}
+    by_b: dict[str, dict] = {}
+    for r in rows_a:
+        k = _row_key(r, key_cols)
+        if k.replace("\t", "") != "":
+            by_a.setdefault(k, r)
+    for r in rows_b:
+        k = _row_key(r, key_cols)
+        if k.replace("\t", "") != "":
+            by_b.setdefault(k, r)
+
+    sa, sb = set(by_a), set(by_b)
+    new_keys = sorted(sb - sa)
+    rem_keys = sorted(sa - sb)
+    com_keys = sorted(sa & sb)
+    key_set  = set(key_cols)
+
+    def _key_rec(k):
+        parts = k.split("\t")
+        return {key_cols[i]: parts[i] if i < len(parts) else "" for i in range(len(key_cols))}
+
+    new_out = []
+    for k in new_keys:
+        rec = _key_rec(k)
+        for c in compare_cols:
+            if c in key_set: continue
+            rec[c] = _display_value(by_b[k].get(c))
+        new_out.append(rec)
+
+    rem_out = []
+    for k in rem_keys:
+        rec = _key_rec(k)
+        for c in compare_cols:
+            if c in key_set: continue
+            rec[c] = _display_value(by_a[k].get(c))
+        rem_out.append(rec)
+
+    mod_summary: list[dict] = []
+    mod_details: list[dict] = []
+    for k in com_keys:
+        ra = by_a[k]; rb = by_b[k]
+        key_rec = _key_rec(k)
+        changed: list[str] = []
+        for c in compare_cols:
+            if c in key_set: continue
+            va = _norm_value(ra.get(c))
+            vb = _norm_value(rb.get(c))
+            if va != vb:
+                changed.append(c)
+                mod_details.append({
+                    **key_rec,
+                    "Column": c,
+                    "Old Value": _display_value(ra.get(c)),
+                    "New Value": _display_value(rb.get(c)),
+                })
+        if changed:
+            mod_summary.append({
+                **key_rec,
+                "Columns Changed": ", ".join(changed),
+                "Change Count": len(changed),
+            })
+
+    return new_out, mod_summary, mod_details, rem_out
 
 
-def _build_excel(new_rows, mod_summary_rows, mod_detail_rows, rem_rows) -> bytes:
+def _build_compare_excel(new_rows, mod_summary, mod_details, rem_rows, compare_cols, key_cols) -> bytes:
     wb = _openpyxl.Workbook()
 
-    def write(name, rows, headers, color, is_first=False):
-        if is_first:
-            ws = wb.active
+    def write(name, rows, headers, color, first=False):
+        ws = wb.active if first else wb.create_sheet(name)
+        if first:
             ws.title = name
-        else:
-            ws = wb.create_sheet(name)
         ws.append(headers)
         for col, _ in enumerate(headers, 1):
             c = ws.cell(row=1, column=col)
@@ -816,205 +912,212 @@ def _build_excel(new_rows, mod_summary_rows, mod_detail_rows, rem_rows) -> bytes
             ws.column_dimensions[_openpyxl.utils.get_column_letter(ci)].width = min(max(12, ml + 2), 80)
         ws.freeze_panes = "A2"
 
-    write("New", new_rows, ["Case Number", "File Name (End)"], "2E7D32", is_first=True)
-    write("Modified (Summary)", mod_summary_rows,
-          ["Case Number", "File Name (Start)", "File Name (End)", "Sections Changed", "Change Summary"],
-          "1565C0")
-    write("Modified (Details)", mod_detail_rows,
-          ["Case Number", "File Name (End)", "Section", "Change Type", "Row Content"],
-          "3949AB")
-    write("No Longer In File", rem_rows, ["Case Number", "File Name (Start)"], "C62828")
+    key_set = set(key_cols)
+    other_cols = [c for c in compare_cols if c not in key_set]
+    full_headers = list(key_cols) + other_cols
+    summary_hdrs = list(key_cols) + ["Columns Changed", "Change Count"]
+    details_hdrs = list(key_cols) + ["Column", "Old Value", "New Value"]
+
+    write("New", new_rows, full_headers, "2E7D32", first=True)
+    write("Modified (Summary)", mod_summary, summary_hdrs, "1565C0")
+    write("Modified (Details)", mod_details, details_hdrs, "3949AB")
+    write("No Longer In File", rem_rows, full_headers, "C62828")
 
     buf = _io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
 
-def render_case_folder_compare() -> None:
+def render_spreadsheet_compare() -> None:
     st.markdown(
         """
         <div class="hub-hero">
-            <h1>Case Folder Comparison</h1>
-            <p>Upload a starting folder and an ending folder of case action summary CSVs.
-            The tool matches files by case number (e.g. <code>SM-2025-900752</code>), normalizes
-            away formatting noise (date padding, time padding, dollar-sign spacing, parens vs minus,
-            CSV quoting), and reports New, Modified, and No Longer In File in one Excel workbook.</p>
+            <h1>Spreadsheet Comparison</h1>
+            <p>Upload two snapshots of the same spreadsheet (the older version and the newer version).
+            The tool matches rows by a key column you pick, reports new, removed, and changed rows,
+            and ignores formatting-only differences like date padding, time padding, dollar-sign
+            spacing, parens-vs-minus, and CSV whitespace.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    with st.expander("How matching works", expanded=False):
+    with st.expander("How it works", expanded=False):
         st.markdown(
-            "- Files match by case number, not exact filename. So `10080_68-SM-2024-901842.csv` "
-            "and `10080_01-SM-2024-901842.csv` are paired as the same case.\n"
-            "- Supported prefixes: SM, CV, DV, CC, JU, TR, TP.\n"
-            "- A case is **Modified** only when one of these sections has a real added/removed row: "
-            "Fee Sheet, Financial History, Case information, Case Type, Court Action, Damages, "
-            "Party List, Consolidated Case Action Summary, Style.\n"
-            "- Pure formatting differences are ignored."
+            "- Upload the **starting** spreadsheet (older) and the **ending** spreadsheet (newer).\n"
+            "- The tool auto-detects a likely key column (Beam Number, Case Number, Account ID, etc.) "
+            "and lets you adjust the selection.\n"
+            "- If one column isn't unique per row (for example, a case has multiple garnishments), "
+            "you can add more columns to make a composite key.\n"
+            "- A row is flagged **Modified** only when one or more cell values differ after "
+            "normalization (dates → `MM/DD/YYYY`, times → `HH:MM:SS AM/PM`, money → `$0.00` form, "
+            "whitespace and quoting collapsed, control chars stripped).\n"
+            "- Supports `.xlsx` and `.csv`. The first sheet of an `.xlsx` is used. Blank rows above "
+            "the header are detected and skipped."
         )
 
-    st.markdown('<div class="section-label">1. Upload the starting folder</div>', unsafe_allow_html=True)
-    start_folder = st.file_uploader(
-        "Starting folder (older export)",
-        type=["csv"],
-        accept_multiple_files="directory",
-        help="Pick the folder of CSV files you want to use as the baseline.",
-        key="cfc_start_folder",
+    st.markdown('<div class="section-label">1. Upload the starting spreadsheet</div>', unsafe_allow_html=True)
+    start_upload = st.file_uploader(
+        "Starting spreadsheet (older snapshot)",
+        type=["xlsx", "xls", "csv"],
+        accept_multiple_files=False,
+        key="sc_start_file",
     )
 
-    st.markdown('<div class="section-label">2. Upload the ending folder</div>', unsafe_allow_html=True)
-    end_folder = st.file_uploader(
-        "Ending folder (newer export)",
-        type=["csv"],
-        accept_multiple_files="directory",
-        help="Pick the folder of CSV files you want to compare against the starting folder.",
-        key="cfc_end_folder",
+    st.markdown('<div class="section-label">2. Upload the ending spreadsheet</div>', unsafe_allow_html=True)
+    end_upload = st.file_uploader(
+        "Ending spreadsheet (newer snapshot)",
+        type=["xlsx", "xls", "csv"],
+        accept_multiple_files=False,
+        key="sc_end_file",
     )
 
-    start_all = list(start_folder or [])
-    end_all   = list(end_folder or [])
+    if not (start_upload and end_upload):
+        st.info("Upload both spreadsheets to continue.")
+        return
+
+    try:
+        _sheet_a, headers_a, rows_a = _read_uploaded(start_upload)
+    except Exception as exc:
+        st.error(f"Could not read the starting spreadsheet: {exc}")
+        return
+    try:
+        _sheet_b, headers_b, rows_b = _read_uploaded(end_upload)
+    except Exception as exc:
+        st.error(f"Could not read the ending spreadsheet: {exc}")
+        return
+
+    set_a, set_b = set(headers_a), set(headers_b)
+    common_cols = [h for h in headers_a if h in set_b]
+    only_a = [h for h in headers_a if h not in set_b]
+    only_b = [h for h in headers_b if h not in set_a]
 
     st.markdown(
         f"""
         <div class="metric-strip">
-            <div class="metric-box"><strong>{len(start_all)}</strong><span>starting CSV file(s)</span></div>
-            <div class="metric-box"><strong>{len(end_all)}</strong><span>ending CSV file(s)</span></div>
-            <div class="metric-box"><strong>Excel</strong><span>downloadable report</span></div>
+            <div class="metric-box"><strong>{len(rows_a)}</strong><span>rows in starting file</span></div>
+            <div class="metric-box"><strong>{len(rows_b)}</strong><span>rows in ending file</span></div>
+            <div class="metric-box"><strong>{len(common_cols)}</strong><span>shared columns</span></div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    run = st.button("Compare folders", type="primary", use_container_width=True, disabled=not (start_all and end_all))
-    if run:
-        progress = st.progress(0, text="Reading starting folder...")
-        start_map = _group_uploads_by_case(start_all)
-        progress.progress(15, text="Reading ending folder...")
-        end_map = _group_uploads_by_case(end_all)
+    if not common_cols:
+        st.error(
+            "The two spreadsheets have no shared columns, so rows can't be matched. "
+            "Make sure both files have the same column headers."
+        )
+        if only_a:
+            st.write(f"**Only in starting file:** {', '.join(only_a)}")
+        if only_b:
+            st.write(f"**Only in ending file:** {', '.join(only_b)}")
+        return
 
-        sk = set(start_map.keys())
-        ek = set(end_map.keys())
-        new_keys = sorted(ek - sk)
-        rem_keys = sorted(sk - ek)
-        com_keys = sorted(sk & ek)
+    if only_a or only_b:
+        with st.expander("Column differences (header-level)", expanded=False):
+            if only_a:
+                st.write(f"**Columns only in starting file:** {', '.join(only_a)}")
+            if only_b:
+                st.write(f"**Columns only in ending file:** {', '.join(only_b)}")
+            st.caption("These columns are ignored when comparing rows. Only shared columns are compared.")
 
-        new_rows = [{"Case Number": k, "File Name (End)": end_map[k][0]} for k in new_keys]
-        rem_rows = [{"Case Number": k, "File Name (Start)": start_map[k][0]} for k in rem_keys]
-        mod_summary_rows: list[dict] = []
-        mod_detail_rows:  list[dict] = []
+    suggested = _suggest_key(headers_a, headers_b)
+    default_keys = [suggested] if suggested in common_cols else ([common_cols[0]] if common_cols else [])
+    key_cols = st.multiselect(
+        "Key column(s) — pick one or more to uniquely identify a row",
+        options=common_cols,
+        default=default_keys,
+        help="Auto-detected key is selected. If one column isn't unique (e.g. a case has multiple garnishments), add more columns to make the key unique per row.",
+        key="sc_key_cols",
+    )
+    if not key_cols:
+        st.warning("Pick at least one key column.")
+        return
 
-        total = len(com_keys)
-        for i, k in enumerate(com_keys, 1):
-            sname, sbytes = start_map[k]
-            ename, ebytes = end_map[k]
-            try:
-                sa = _parse_sections(_parse_csv_bytes(sbytes))
-                sb = _parse_sections(_parse_csv_bytes(ebytes))
-                d  = _diff_sections(sa, sb)
-                if d:
-                    mod_summary_rows.append({
-                        "Case Number": k,
-                        "File Name (Start)": sname,
-                        "File Name (End)":   ename,
-                        "Sections Changed":  ", ".join(d.keys()),
-                        "Change Summary":    _summarize(d),
-                    })
-                    for sec, dd in d.items():
-                        for row in dd["added"]:
-                            mod_detail_rows.append({
-                                "Case Number": k,
-                                "File Name (End)": ename,
-                                "Section": sec,
-                                "Change Type": "ADDED",
-                                "Row Content": " | ".join(row),
-                            })
-                        for row in dd["removed"]:
-                            mod_detail_rows.append({
-                                "Case Number": k,
-                                "File Name (End)": ename,
-                                "Section": sec,
-                                "Change Type": "REMOVED",
-                                "Row Content": " | ".join(row),
-                            })
-            except Exception as exc:
-                mod_summary_rows.append({
-                    "Case Number": k,
-                    "File Name (Start)": sname,
-                    "File Name (End)":   ename,
-                    "Sections Changed":  "ERROR",
-                    "Change Summary":    f"Read/parse error: {exc}",
-                })
-            if i % 10 == 0 or i == total:
-                pct = 15 + int(80 * i / max(total, 1))
-                progress.progress(min(pct, 95), text=f"Compared {i} of {total} common files")
+    # Duplicate-key check on the chosen key
+    keys_a_all = [_row_key(r, key_cols) for r in rows_a]
+    keys_b_all = [_row_key(r, key_cols) for r in rows_b]
+    dup_a = sum(1 for c in _Counter(keys_a_all).values() if c > 1)
+    dup_b = sum(1 for c in _Counter(keys_b_all).values() if c > 1)
+    if dup_a or dup_b:
+        st.warning(
+            f"Heads up: with the key column(s) you picked, **{dup_a}** duplicate key(s) exist in the "
+            f"starting file and **{dup_b}** in the ending file. Only the FIRST row for each duplicate "
+            "is compared. Add more columns to the key to make rows unique."
+        )
 
-        progress.progress(98, text="Building Excel report...")
-        excel_bytes = _build_excel(new_rows, mod_summary_rows, mod_detail_rows, rem_rows)
+    if st.button("Compare spreadsheets", type="primary", use_container_width=True):
+        progress = st.progress(0, text="Comparing rows...")
+        new_rows, mod_summary, mod_details, rem_rows = _compare_rows(
+            rows_a, rows_b, key_cols, common_cols
+        )
+        progress.progress(80, text="Building Excel report...")
+        excel_bytes = _build_compare_excel(
+            new_rows, mod_summary, mod_details, rem_rows, common_cols, key_cols
+        )
         progress.progress(100, text="Done")
 
-        st.session_state["cfc_new_rows"]     = new_rows
-        st.session_state["cfc_summary_rows"] = mod_summary_rows
-        st.session_state["cfc_detail_rows"]  = mod_detail_rows
-        st.session_state["cfc_rem_rows"]     = rem_rows
-        st.session_state["cfc_excel"]        = excel_bytes
-        st.session_state["cfc_unchanged"]    = total - len(mod_summary_rows)
+        st.session_state["sc_new"]      = new_rows
+        st.session_state["sc_summary"]  = mod_summary
+        st.session_state["sc_details"]  = mod_details
+        st.session_state["sc_rem"]      = rem_rows
+        st.session_state["sc_excel"]    = excel_bytes
+        st.session_state["sc_keys"]     = key_cols
+        common_count = len(set(keys_a_all) & set(keys_b_all))
+        st.session_state["sc_unchanged"] = max(0, common_count - len(mod_summary))
 
-    if "cfc_excel" in st.session_state:
-        new_rows     = st.session_state["cfc_new_rows"]
-        mod_summary  = st.session_state["cfc_summary_rows"]
-        mod_detail   = st.session_state["cfc_detail_rows"]
-        rem_rows     = st.session_state["cfc_rem_rows"]
-        unchanged    = st.session_state["cfc_unchanged"]
+    if "sc_excel" in st.session_state:
+        new_rows    = st.session_state["sc_new"]
+        mod_summary = st.session_state["sc_summary"]
+        mod_details = st.session_state["sc_details"]
+        rem_rows    = st.session_state["sc_rem"]
+        unchanged   = st.session_state.get("sc_unchanged", 0)
 
         st.markdown(
             f"""
             <div class="metric-strip">
-                <div class="metric-box"><strong>{len(new_rows)}</strong><span>new cases</span></div>
-                <div class="metric-box"><strong>{len(mod_summary)}</strong><span>modified cases ({len(mod_detail)} changes)</span></div>
+                <div class="metric-box"><strong>{len(new_rows)}</strong><span>new rows</span></div>
+                <div class="metric-box"><strong>{len(mod_summary)}</strong><span>modified rows ({len(mod_details)} cell changes)</span></div>
                 <div class="metric-box"><strong>{len(rem_rows)}</strong><span>no longer in file</span></div>
             </div>
             """,
             unsafe_allow_html=True,
         )
-        st.caption(
-            f"{unchanged} common files had no real changes after normalization "
-            "(formatting-only differences were ignored)."
-        )
+        st.caption(f"{unchanged} row(s) had no real changes after normalization (formatting-only differences ignored).")
 
         st.download_button(
             "Download Excel report",
-            data=st.session_state["cfc_excel"],
-            file_name="Case Folder Comparison.xlsx",
+            data=st.session_state["sc_excel"],
+            file_name="Spreadsheet Comparison.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
             use_container_width=True,
         )
 
-        tab_new, tab_mod_sum, tab_mod_det, tab_rem = st.tabs(
+        tab_new, tab_sum, tab_det, tab_rem = st.tabs(
             ["New", "Modified (Summary)", "Modified (Details)", "No Longer In File"]
         )
         with tab_new:
             if new_rows:
                 st.dataframe(new_rows, use_container_width=True, hide_index=True)
             else:
-                st.info("No new cases.")
-        with tab_mod_sum:
+                st.info("No new rows.")
+        with tab_sum:
             if mod_summary:
                 st.dataframe(mod_summary, use_container_width=True, hide_index=True)
             else:
-                st.info("No modified cases.")
-        with tab_mod_det:
-            if mod_detail:
-                st.dataframe(mod_detail, use_container_width=True, hide_index=True)
+                st.info("No modified rows.")
+        with tab_det:
+            if mod_details:
+                st.dataframe(mod_details, use_container_width=True, hide_index=True)
             else:
-                st.info("No individual changes to show.")
+                st.info("No cell-level changes.")
         with tab_rem:
             if rem_rows:
                 st.dataframe(rem_rows, use_container_width=True, hide_index=True)
             else:
-                st.info("No removed cases.")
+                st.info("No removed rows.")
 
 
 def render_beam_pdf_splitter() -> None:
@@ -1227,11 +1330,11 @@ def get_tools() -> list[ToolDefinition]:
             render=render_beam_pdf_splitter,
         ),
         ToolDefinition(
-            tool_id="case-folder-compare",
-            name="Case Folder Comparison",
+            tool_id="spreadsheet-compare",
+            name="Spreadsheet Comparison",
             category="Documents",
-            description="Compare two folders of case action summary CSVs. Detect new, modified, and removed cases; ignore formatting-only differences.",
-            render=render_case_folder_compare,
+            description="Compare two snapshots of a spreadsheet (.xlsx or .csv). Match rows by a key column; report new, removed, and changed rows; ignore formatting-only differences.",
+            render=render_spreadsheet_compare,
         ),
     ]
 
