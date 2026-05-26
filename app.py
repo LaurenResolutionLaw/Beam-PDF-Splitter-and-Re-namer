@@ -856,39 +856,25 @@ def render_case_folder_compare() -> None:
         )
 
     st.markdown('<div class="section-label">1. Upload the starting folder</div>', unsafe_allow_html=True)
-    start_uploads = st.file_uploader(
+    start_folder = st.file_uploader(
         "Starting folder (older export)",
         type=["csv"],
-        accept_multiple_files=True,
-        help="Pick all CSVs from the starting folder, or use folder upload below.",
-        key="cfc_start_files",
-    )
-    start_folder = st.file_uploader(
-        "OR upload a whole folder",
-        type=["csv"],
         accept_multiple_files="directory",
-        help="Use this when your browser supports folder upload.",
+        help="Pick the folder of CSV files you want to use as the baseline.",
         key="cfc_start_folder",
     )
 
     st.markdown('<div class="section-label">2. Upload the ending folder</div>', unsafe_allow_html=True)
-    end_uploads = st.file_uploader(
+    end_folder = st.file_uploader(
         "Ending folder (newer export)",
         type=["csv"],
-        accept_multiple_files=True,
-        help="Pick all CSVs from the ending folder, or use folder upload below.",
-        key="cfc_end_files",
-    )
-    end_folder = st.file_uploader(
-        "OR upload a whole folder",
-        type=["csv"],
         accept_multiple_files="directory",
-        help="Use this when your browser supports folder upload.",
+        help="Pick the folder of CSV files you want to compare against the starting folder.",
         key="cfc_end_folder",
     )
 
-    start_all = list(start_uploads or []) + list(start_folder or [])
-    end_all   = list(end_uploads or [])   + list(end_folder or [])
+    start_all = list(start_folder or [])
+    end_all   = list(end_folder or [])
 
     st.markdown(
         f"""
