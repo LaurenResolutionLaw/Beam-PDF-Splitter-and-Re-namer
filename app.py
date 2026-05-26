@@ -643,6 +643,8 @@ _CASE_RE  = _re.compile(r"((?:SM|CV|DV|CC|JU|TR|TP)-\d{4}-\d{4,7})", _re.IGNOREC
 _DATE_RE  = _re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4})$")
 _TIME_RE  = _re.compile(r"^(\d{1,2}):(\d{2}):(\d{2})\s*(AM|PM|am|pm)?$")
 _MONEY_RE = _re.compile(r"^\(\s*-?\$?\s*-?[\d,]+(?:\.\d+)?\s*\)$|^-?\$\s*-?[\d,]+(?:\.\d+)?$")
+# ASCII control chars that openpyxl rejects (and that have no business in a CSV cell anyway)
+_ILLEGAL_RE = _re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 _SECTIONS = [
     "Style", "Fee Sheet", "Financial History", "Case information",
@@ -660,7 +662,9 @@ def _case_key(filename: str):
 def _norm_cell(v) -> str:
     if v is None:
         return ""
-    s = str(v).replace(" ", " ").strip()
+    s = str(v).replace(" ", " ")
+    # Strip ASCII control chars that openpyxl refuses to write
+    s = _ILLEGAL_RE.sub("", s).strip()
     s = _re.sub(r"\s+", " ", s)
     if s == "":
         return ""
