@@ -653,6 +653,16 @@ _KEY_HINTS = [
     "ID", "Id",
 ]
 
+# Substrings that mark a column as "volatile" — its value changes across snapshots,
+# so it shouldn't be part of an auto-detected composite key. (User can still pick
+# manually if they want.)
+_KEY_ANTI_HINTS = [
+    "answer", "status", "amount", "holding", "cost", "balance", "paid",
+    "due", "collected", "notes", "comment", "remark", "received",
+    "withheld", "withholding", "response", "result", "outcome", "phase",
+    "stage", "stop", "motion", "order",
+]
+
 
 def _norm_value(v) -> str:
     if v is None:
@@ -822,6 +832,56 @@ def _suggest_key(headers_a, headers_b) -> str | None:
 
 def _row_key(rec, key_cols):
     return "\t".join(_norm_value(rec.get(c)) for c in key_cols)
+
+
+def _is_volatile_col(col_name: str) -> bool:
+    """Columns whose names suggest they hold value/state data that changes
+    between snapshots — bad candidates for an auto-detected key."""
+    lower = col_name.lower()
+    return any(anti in lower for anti in _KEY_ANTI_HINTS)
+
+
+def _smart_suggest_keys(rows_a, rows_b, common_cols, max_cols=4):
+    """Greedy auto-detect a composite key. Starts with the heuristic single-column
+    suggestion and extends with whichever extra column reduces the duplicate-key
+    count the most, until duplicates hit zero or no column helps. Capped at max_cols.
+
+    The extender prefers "identifying" columns (names, dates, IDs) and avoids
+    "volatile" columns (Answer, Status, Amount, etc.) — those change between
+    snapshots, so including them in the key would make a single modified row
+    look like one removed + one new."""
+    if not common_cols:
+        return []
+    seed = _suggest_key(common_cols, common_cols)
+    if seed not in common_cols:
+        seed = common_cols[0]
+    chosen = [seed]
+
+    def dup_count(cols):
+        keys_a = [_row_key(r, cols) for r in rows_a]
+        keys_b = [_row_key(r, cols) for r in rows_b]
+        ca = _Counter(keys_a); cb = _Counter(keys_b)
+        return sum(1 for c in ca.values() if c > 1) + sum(1 for c in cb.values() if c > 1)
+
+    # First pass: only consider non-volatile columns
+    safe_cols = [c for c in common_cols if not _is_volatile_col(c)]
+    while len(chosen) < max_cols:
+        current = dup_count(chosen)
+        if current == 0:
+            break
+        best_col = None
+        best_dups = current
+        for c in safe_cols:
+            if c in chosen:
+                continue
+            d = dup_count(chosen + [c])
+            if d < best_dups:
+                best_dups = d
+                best_col = c
+        if best_col is None:
+            break
+        chosen.append(best_col)
+    return chosen
 
 
 def _compare_rows(rows_a, rows_b, key_cols, compare_cols):
@@ -1022,13 +1082,14 @@ def render_spreadsheet_compare() -> None:
                 st.write(f"**Columns only in ending file:** {', '.join(only_b)}")
             st.caption("These columns are ignored when comparing rows. Only shared columns are compared.")
 
-    suggested = _suggest_key(headers_a, headers_b)
-    default_keys = [suggested] if suggested in common_cols else ([common_cols[0]] if common_cols else [])
+    default_keys = _smart_suggest_keys(rows_a, rows_b, common_cols)
+    if not default_keys and common_cols:
+        default_keys = [common_cols[0]]
     key_cols = st.multiselect(
         "Key column(s) — pick one or more to uniquely identify a row",
         options=common_cols,
         default=default_keys,
-        help="Auto-detected key is selected. If one column isn't unique (e.g. a case has multiple garnishments), add more columns to make the key unique per row.",
+        help="Auto-detected composite key, chosen to minimize duplicate rows. Adjust if needed.",
         key="sc_key_cols",
     )
     if not key_cols:
