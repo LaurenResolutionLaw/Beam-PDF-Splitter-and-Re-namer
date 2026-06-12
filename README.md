@@ -2,7 +2,10 @@
 
 A Streamlit web app for Resolution Law office tools.
 
-The first tool is **Beam PDF Splitter**, which splits PDFs into two-page chunks and renames each output file from the beam number found in the footer of the second page.
+The toolbox includes:
+
+- **Beam PDF Splitter**, which splits PDFs into two-page chunks and renames each output file from the beam number found in the footer of the second page.
+- **Affidavit PDF Splitter**, which splits affidavit PDFs into two-page chunks, reads the `OFN:` number from the bottom of each second page, and saves each output as `W<number>.pdf` such as `W12942.pdf`.
 
 The app is built as an expandable toolbox, so more tools can be added later.
 

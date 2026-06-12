@@ -18,7 +18,9 @@ import streamlit as st
 
 APP_TITLE = "Resolution Law Tools"
 FOOTER_TOP_RATIO = 0.92
+OFN_FOOTER_TOP_RATIO = 0.65
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+OFN_PATTERN = re.compile(r"\b[O0]\s*F\s*N\s*[:;#-]?\s*([0-9][0-9\s,.\-]{1,24})", re.IGNORECASE)
 
 
 @dataclass
@@ -50,6 +52,16 @@ class SplitResult:
     pages: str
     output_file: str
     beam_number: str
+    method: str
+    status: str
+
+
+@dataclass
+class Splitter2Result:
+    source_file: str
+    pages: str
+    output_file: str
+    ofn_number: str
     method: str
     status: str
 
@@ -348,6 +360,101 @@ def extract_beam_number_from_page(
     return find_ocr_footer_number(page, ocr_error_callback)
 
 
+def normalize_ofn_number(value: str) -> str | None:
+    digits = re.sub(r"\D", "", value or "")
+    return digits if len(digits) >= 2 else None
+
+
+def find_ofn_number_in_text(text: str) -> str | None:
+    if not text:
+        return None
+
+    normalized = " ".join(text.split())
+    for match in OFN_PATTERN.finditer(normalized):
+        ofn_number = normalize_ofn_number(match.group(1))
+        if ofn_number:
+            return ofn_number
+
+    return None
+
+
+def find_ofn_number_in_tokens(tokens: list[str]) -> str | None:
+    clean_tokens = [token.strip() for token in tokens if token and token.strip()]
+    for index in range(len(clean_tokens)):
+        candidate_text = " ".join(clean_tokens[index:index + 6])
+        ofn_number = find_ofn_number_in_text(candidate_text)
+        if ofn_number:
+            return ofn_number
+
+    return None
+
+
+def find_native_footer_ofn_number(page) -> str | None:
+    page_rect = page.rect
+    footer_y = page_rect.height * OFN_FOOTER_TOP_RATIO
+    footer_rect = fitz.Rect(0, footer_y, page_rect.width, page_rect.height)
+    text = page.get_text("text", clip=footer_rect) or ""
+    ofn_number = find_ofn_number_in_text(text)
+    if ofn_number:
+        return ofn_number
+
+    words = [
+        str(word[4])
+        for word in page.get_text("words")
+        if len(word) >= 5 and float(word[1]) >= footer_y
+    ]
+    return find_ofn_number_in_tokens(words)
+
+
+def find_ocr_footer_ofn_number(page, ocr_error_callback: Callable[[Exception], None] | None = None) -> tuple[str | None, str]:
+    try:
+        from PIL import Image, ImageOps
+        import pytesseract
+
+        configure_tesseract(pytesseract)
+        page_rect = page.rect
+        footer_rect = fitz.Rect(0, page_rect.height * OFN_FOOTER_TOP_RATIO, page_rect.width, page_rect.height)
+        matrix = fitz.Matrix(3, 3)
+        pixmap = page.get_pixmap(matrix=matrix, clip=footer_rect, alpha=False)
+        image = Image.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples)
+        image = ImageOps.autocontrast(ImageOps.grayscale(image))
+
+        for config in ("--psm 6", "--psm 11"):
+            ocr_text = pytesseract.image_to_string(image, config=config)
+            ofn_number = find_ofn_number_in_text(ocr_text)
+            if ofn_number:
+                return ofn_number, "OCR"
+
+        data = pytesseract.image_to_data(
+            image,
+            config="--psm 6",
+            output_type=pytesseract.Output.DICT,
+        )
+        ofn_number = find_ofn_number_in_tokens(data.get("text", []))
+        if ofn_number:
+            return ofn_number, "OCR"
+    except Exception as exc:
+        if ocr_error_callback is not None:
+            ocr_error_callback(exc)
+
+    return None, "not found"
+
+
+def extract_ofn_number_from_page(
+    page,
+    use_ocr: bool,
+    ocr_error_callback: Callable[[Exception], None] | None = None,
+) -> tuple[str | None, str]:
+    ofn_number = find_native_footer_ofn_number(page)
+    if ofn_number:
+        return ofn_number, "native text"
+
+    if not use_ocr:
+        return None, "not found"
+
+    return find_ocr_footer_ofn_number(page, ocr_error_callback)
+
+
 def save_page_range_to_bytes(doc, start_page: int, end_page: int) -> bytes:
     out_doc = fitz.open()
     try:
@@ -607,6 +714,116 @@ def split_and_rename_pdfs(uploaded_files, include_odd_final_page: bool, use_fall
                                 pages=str(page_count),
                                 output_file=output_file,
                                 beam_number="",
+                                method="odd final page",
+                                status="Included as single-page output.",
+                            )
+                        )
+                    else:
+                        logs.append(f"{source_name} page {page_count}: odd final page skipped.")
+            finally:
+                doc.close()
+
+    if written == 0:
+        return None, [asdict(row) for row in rows], logs + ["No PDF chunks were created."]
+
+    return output.getvalue(), [asdict(row) for row in rows], logs
+
+
+# ============================================================================
+# Affidavit PDF Splitter
+# Splits affidavit PDFs into two-page chunks and names outputs from OFN numbers.
+# ============================================================================
+def split_and_rename_ofn_pdfs(uploaded_files, include_odd_final_page: bool, use_fallback_names: bool) -> tuple[bytes | None, list[dict], list[str]]:
+    logs: list[str] = []
+    rows: list[Splitter2Result] = []
+    output = BytesIO()
+    used_names: set[str] = set()
+    fallback_counter = 1
+    written = 0
+    use_ocr = ocr_available()
+    ocr_warning_logged = False
+
+    if not use_ocr:
+        logs.append("OCR is unavailable on the server. Native PDFs may still work, but scanned PDFs need Tesseract OCR.")
+
+    def warn_ocr_once(exc: Exception) -> None:
+        nonlocal ocr_warning_logged
+        if not ocr_warning_logged:
+            logs.append(f"OCR warning: {exc}")
+            ocr_warning_logged = True
+
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for uploaded_file in uploaded_files:
+            data = uploaded_file.getvalue()
+            source_name = Path(uploaded_file.name).name
+
+            try:
+                doc = fitz.open(stream=data, filetype="pdf")
+            except Exception as exc:
+                logs.append(f"{source_name}: could not open PDF ({exc}).")
+                continue
+
+            try:
+                page_count = doc.page_count
+                pair_page_count = page_count - (page_count % 2)
+
+                for start_page in range(0, pair_page_count, 2):
+                    end_page = start_page + 1
+                    pages = f"{start_page + 1}-{end_page + 1}"
+                    ofn_number, method = extract_ofn_number_from_page(doc[end_page], use_ocr, warn_ocr_once)
+                    status = "OFN number found."
+
+                    if ofn_number:
+                        stem = f"W{ofn_number}"
+                    elif use_fallback_names:
+                        stem = f"unnamed_{fallback_counter:03d}"
+                        fallback_counter += 1
+                        status = "OFN number not found; fallback name used."
+                    else:
+                        logs.append(f"{source_name} pages {pages}: OFN number not found; skipped.")
+                        rows.append(
+                            Splitter2Result(
+                                source_file=source_name,
+                                pages=pages,
+                                output_file="",
+                                ofn_number="",
+                                method="not found",
+                                status="Skipped - OFN number not found.",
+                            )
+                        )
+                        continue
+
+                    unique_stem = make_unique_stem(used_names, stem, f"unnamed_{fallback_counter:03d}")
+                    output_file = f"{unique_stem}.pdf"
+                    pdf_bytes = save_page_range_to_bytes(doc, start_page, end_page)
+                    archive.writestr(output_file, pdf_bytes)
+                    written += 1
+                    rows.append(
+                        Splitter2Result(
+                            source_file=source_name,
+                            pages=pages,
+                            output_file=output_file,
+                            ofn_number=ofn_number or "",
+                            method=method,
+                            status=status,
+                        )
+                    )
+
+                if page_count % 2:
+                    last_page = page_count - 1
+                    if include_odd_final_page:
+                        stem = f"{Path(source_name).stem}_page_{page_count:03d}"
+                        unique_stem = make_unique_stem(used_names, stem, stem)
+                        output_file = f"{unique_stem}.pdf"
+                        pdf_bytes = save_page_range_to_bytes(doc, last_page, last_page)
+                        archive.writestr(output_file, pdf_bytes)
+                        written += 1
+                        rows.append(
+                            Splitter2Result(
+                                source_file=source_name,
+                                pages=str(page_count),
+                                output_file=output_file,
+                                ofn_number="",
                                 method="odd final page",
                                 status="Included as single-page output.",
                             )
@@ -1311,12 +1528,150 @@ def render_beam_pdf_splitter() -> None:
         )
 
 
+def render_affidavit_pdf_splitter() -> None:
+    st.markdown(
+        """
+        <div class="hub-hero">
+            <h1>Affidavit PDF Splitter</h1>
+            <p>Upload affidavit PDFs, split them into two-page files, and name each output from the OFN number at the bottom of the second page.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("Processing rules", expanded=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            include_odd_final_page = st.checkbox(
+                "Include odd final page as a single-page PDF",
+                value=False,
+                key="affidavit_include_odd_final_page",
+            )
+        with col2:
+            use_fallback_names = st.checkbox(
+                "Use fallback name if OFN number is not found",
+                value=False,
+                key="affidavit_use_fallback_names",
+            )
+
+    st.markdown('<div class="section-label">Upload PDFs</div>', unsafe_allow_html=True)
+    upload_tabs = st.tabs(["Single or multiple PDF files", "Folder of PDFs"])
+    with upload_tabs[0]:
+        file_uploads = st.file_uploader(
+            "Choose one PDF or several PDFs",
+            type=["pdf"],
+            accept_multiple_files=True,
+            help="Use this when you have one PDF or a few PDFs selected manually.",
+            key="affidavit_pdf_file_uploads",
+        )
+    with upload_tabs[1]:
+        folder_uploads = st.file_uploader(
+            "Choose a folder",
+            type=["pdf"],
+            accept_multiple_files="directory",
+            help="Use this when you want to upload all PDFs from a folder.",
+            key="affidavit_pdf_folder_uploads",
+        )
+
+    uploaded_files = list(file_uploads or []) + list(folder_uploads or [])
+    upload_signature = uploaded_files_signature(uploaded_files)
+    if st.session_state.get("affidavit_upload_signature") != upload_signature:
+        st.session_state["affidavit_upload_signature"] = upload_signature
+        st.session_state["affidavit_zip_bytes"] = None
+        st.session_state["affidavit_result_rows"] = []
+        st.session_state["affidavit_result_logs"] = []
+
+    if not uploaded_files:
+        left, right = st.columns(2)
+        with left:
+            st.markdown(
+                """
+                <div class="tool-card">
+                    <h3>What it does</h3>
+                    <p>Splits page pairs like 1-2, 3-4, 5-6 and names each output W plus the OFN number from the bottom of the second page.</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with right:
+            st.markdown(
+                """
+                <div class="tool-card">
+                    <h3>Output names</h3>
+                    <p>If the second page says OFN: 12942, the downloaded file will be named W12942.pdf.</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        return
+
+    expected_pairs = 0
+    for uploaded_file in uploaded_files:
+        try:
+            with fitz.open(stream=uploaded_file.getvalue(), filetype="pdf") as doc:
+                expected_pairs += doc.page_count // 2
+        except Exception:
+            pass
+
+    st.markdown(
+        f"""
+        <div class="metric-strip">
+            <div class="metric-box"><strong>{len(uploaded_files)}</strong><span>PDF upload(s)</span></div>
+            <div class="metric-box"><strong>{expected_pairs}</strong><span>two-page output file(s)</span></div>
+            <div class="metric-box"><strong>W + OFN</strong><span>filename format</span></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.caption("After upload, click the button below. The app will create one renamed PDF for each two-page pair.")
+
+    if st.button("Split Affidavit PDFs", type="primary", use_container_width=True):
+        progress = st.progress(0, text="Splitting PDFs...")
+        try:
+            zip_bytes, result_rows, logs = split_and_rename_ofn_pdfs(uploaded_files, include_odd_final_page, use_fallback_names)
+            st.session_state["affidavit_zip_bytes"] = zip_bytes
+            st.session_state["affidavit_result_rows"] = result_rows
+            st.session_state["affidavit_result_logs"] = logs
+            progress.progress(100, text="Finished")
+        except Exception as exc:
+            st.session_state["affidavit_zip_bytes"] = None
+            st.session_state["affidavit_result_rows"] = []
+            st.session_state["affidavit_result_logs"] = [f"Processing failed: {exc}"]
+            progress.progress(100, text="Failed")
+
+    result_rows = st.session_state.get("affidavit_result_rows", [])
+    logs = st.session_state.get("affidavit_result_logs", [])
+
+    if logs:
+        with st.expander("Processing log", expanded=True):
+            for log in logs:
+                st.write(log)
+        if not st.session_state.get("affidavit_zip_bytes"):
+            st.error("No download was created. Check the processing log above.")
+
+    if result_rows:
+        st.subheader("Created Files")
+        st.dataframe(result_rows, use_container_width=True, hide_index=True)
+
+    if st.session_state.get("affidavit_zip_bytes"):
+        st.success("Your affidavit PDFs are split and renamed.")
+        st.download_button(
+            "Download Affidavit Split Results",
+            data=st.session_state["affidavit_zip_bytes"],
+            file_name="affidavit_split_results.zip",
+            mime="application/zip",
+            type="primary",
+            use_container_width=True,
+        )
+
+
 def render_home(tools: list[ToolDefinition]) -> None:
     st.markdown(
         """
         <div class="hub-hero">
             <h1>Resolution Law Tools</h1>
-            <p>A clean web toolbox for PDF, document, and office workflows. Start with Beam PDF Splitter, then add more tools as the team needs them.</p>
+            <p>A clean web toolbox for PDF, document, and office workflows. Use the PDF splitters and spreadsheet tools as the team needs them.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1389,6 +1744,13 @@ def get_tools() -> list[ToolDefinition]:
             category="PDF",
             description="Split PDFs into two-page chunks and name each output from the beam number in the footer.",
             render=render_beam_pdf_splitter,
+        ),
+        ToolDefinition(
+            tool_id="affidavit-pdf-splitter",
+            name="Affidavit PDF Splitter",
+            category="PDF",
+            description="Split affidavit PDFs into two-page chunks and name each output W plus the OFN number from the second page footer.",
+            render=render_affidavit_pdf_splitter,
         ),
         ToolDefinition(
             tool_id="spreadsheet-compare",
