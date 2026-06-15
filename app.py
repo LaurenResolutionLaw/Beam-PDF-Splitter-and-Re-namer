@@ -774,7 +774,7 @@ def split_and_rename_ofn_pdfs(uploaded_files, include_odd_final_page: bool, use_
                     status = "OFN number found."
 
                     if ofn_number:
-                        stem = f"W{ofn_number}"
+                        stem = f"{ofn_number}W"
                     elif use_fallback_names:
                         stem = f"unnamed_{fallback_counter:03d}"
                         fallback_counter += 1
@@ -1588,7 +1588,7 @@ def render_affidavit_pdf_splitter() -> None:
                 """
                 <div class="tool-card">
                     <h3>What it does</h3>
-                    <p>Splits page pairs like 1-2, 3-4, 5-6 and names each output W plus the OFN number from the bottom of the second page.</p>
+                    <p>Splits page pairs like 1-2, 3-4, 5-6 and names each output from the OFN number plus W at the end.</p>
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -1598,7 +1598,7 @@ def render_affidavit_pdf_splitter() -> None:
                 """
                 <div class="tool-card">
                     <h3>Output names</h3>
-                    <p>If the second page says OFN: 12942, the downloaded file will be named W12942.pdf.</p>
+                    <p>If the second page says OFN: 12942, the downloaded file will be named 12942W.pdf.</p>
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -1618,7 +1618,7 @@ def render_affidavit_pdf_splitter() -> None:
         <div class="metric-strip">
             <div class="metric-box"><strong>{len(uploaded_files)}</strong><span>PDF upload(s)</span></div>
             <div class="metric-box"><strong>{expected_pairs}</strong><span>two-page output file(s)</span></div>
-            <div class="metric-box"><strong>W + OFN</strong><span>filename format</span></div>
+            <div class="metric-box"><strong>OFN + W</strong><span>filename format</span></div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1749,7 +1749,7 @@ def get_tools() -> list[ToolDefinition]:
             tool_id="affidavit-pdf-splitter",
             name="Affidavit PDF Splitter",
             category="PDF",
-            description="Split affidavit PDFs into two-page chunks and name each output W plus the OFN number from the second page footer.",
+            description="Split affidavit PDFs into two-page chunks and name each output with the OFN number plus W at the end.",
             render=render_affidavit_pdf_splitter,
         ),
         ToolDefinition(
