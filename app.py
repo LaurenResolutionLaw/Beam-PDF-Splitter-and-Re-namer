@@ -1736,6 +1736,189 @@ def render_future_tools_guide() -> None:
     )
 
 
+# ============================================================================
+# File Name Lister — Resolution Law Tools
+# Takes one or more uploaded files (or a whole folder of files) and builds a
+# spreadsheet (.xlsx) listing every file name. No file contents are read; this
+# just inventories names, types, and sizes so the team can paste the list into
+# a tracker or use it as a checklist.
+# ============================================================================
+def _human_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{num_bytes} B"
+
+
+def build_file_list_rows(uploaded_files) -> list[dict]:
+    rows: list[dict] = []
+    for index, uploaded_file in enumerate(uploaded_files, start=1):
+        raw_name = uploaded_file.name or ""
+        # Folder uploads can include a relative path like "subfolder/file.pdf".
+        normalized = raw_name.replace("\\", "/")
+        folder = ""
+        base_name = normalized
+        if "/" in normalized:
+            folder, base_name = normalized.rsplit("/", 1)
+        stem, dot, ext = base_name.rpartition(".")
+        if not dot:
+            stem, ext = base_name, ""
+        try:
+            size_bytes = len(uploaded_file.getvalue())
+        except Exception:
+            size_bytes = 0
+        rows.append(
+            {
+                "#": index,
+                "File Name": base_name,
+                "Name Without Extension": stem,
+                "Extension": ext.lower(),
+                "Folder": folder,
+                "Size": _human_size(size_bytes),
+                "Size (Bytes)": size_bytes,
+            }
+        )
+    return rows
+
+
+def build_file_list_excel(rows: list[dict]) -> bytes:
+    headers = [
+        "#",
+        "File Name",
+        "Name Without Extension",
+        "Extension",
+        "Folder",
+        "Size",
+        "Size (Bytes)",
+    ]
+    wb = _openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "File Names"
+    ws.append(headers)
+    for col, _ in enumerate(headers, 1):
+        c = ws.cell(row=1, column=col)
+        c.font = _Font(bold=True, color="FFFFFF")
+        c.fill = _PatternFill("solid", fgColor="1565C0")
+        c.alignment = _Alignment(vertical="center")
+    for r in rows:
+        ws.append([r.get(h, "") for h in headers])
+    for ci, h in enumerate(headers, 1):
+        samples = [len(str(h))] + [min(len(str(r.get(h, ""))), 80) for r in rows[:500]]
+        ml = max(samples) if samples else 12
+        ws.column_dimensions[_openpyxl.utils.get_column_letter(ci)].width = min(max(10, ml + 2), 80)
+    ws.freeze_panes = "A2"
+    buf = _io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def render_file_name_lister() -> None:
+    st.markdown(
+        """
+        <div class="hub-hero">
+            <h1>File Name Lister</h1>
+            <p>Upload one file, several files, or a whole folder, and download a spreadsheet that lists every file name.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("How it works", expanded=False):
+        st.markdown(
+            "- Upload a single file, multiple files, or an entire folder.\n"
+            "- The tool reads only the file names, types, and sizes — never the contents.\n"
+            "- You get an .xlsx with one row per file: name, name without extension, extension, folder, and size.\n"
+            "- Use it to build an index, a checklist, or to paste names into another tracker."
+        )
+
+    st.markdown('<div class="section-label">Upload Files</div>', unsafe_allow_html=True)
+    upload_tabs = st.tabs(["Single or multiple files", "Folder of files"])
+    with upload_tabs[0]:
+        file_uploads = st.file_uploader(
+            "Choose one file or several files",
+            accept_multiple_files=True,
+            help="Any file type is allowed. Only the names are recorded.",
+            key="filelist_file_uploads",
+        )
+    with upload_tabs[1]:
+        folder_uploads = st.file_uploader(
+            "Choose a folder",
+            accept_multiple_files="directory",
+            help="Use this to upload every file from a folder at once.",
+            key="filelist_folder_uploads",
+        )
+
+    uploaded_files = list(file_uploads or []) + list(folder_uploads or [])
+    upload_signature = uploaded_files_signature(uploaded_files)
+    if st.session_state.get("filelist_upload_signature") != upload_signature:
+        st.session_state["filelist_upload_signature"] = upload_signature
+        st.session_state["filelist_excel_bytes"] = None
+        st.session_state["filelist_rows"] = []
+
+    if not uploaded_files:
+        left, right = st.columns(2)
+        with left:
+            st.markdown(
+                """
+                <div class="tool-card">
+                    <h3>What it does</h3>
+                    <p>Turns a pile of files into a clean spreadsheet listing every file name, type, and size.</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with right:
+            st.markdown(
+                """
+                <div class="tool-card">
+                    <h3>Names only</h3>
+                    <p>The tool never opens or reads the files. It only records their names and sizes.</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        return
+
+    rows = build_file_list_rows(uploaded_files)
+    st.session_state["filelist_rows"] = rows
+
+    st.markdown(
+        f"""
+        <div class="metric-strip">
+            <div class="metric-box"><strong>{len(rows)}</strong><span>file(s) found</span></div>
+            <div class="metric-box"><strong>{len({r['Extension'] for r in rows})}</strong><span>file type(s)</span></div>
+            <div class="metric-box"><strong>XLSX</strong><span>spreadsheet download</span></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.subheader("File Names")
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    if st.button("Create Spreadsheet", type="primary", use_container_width=True):
+        try:
+            st.session_state["filelist_excel_bytes"] = build_file_list_excel(rows)
+        except Exception as exc:
+            st.session_state["filelist_excel_bytes"] = None
+            st.error(f"Could not build the spreadsheet: {exc}")
+
+    if st.session_state.get("filelist_excel_bytes"):
+        st.success("Your file name spreadsheet is ready.")
+        st.download_button(
+            "Download File Name Spreadsheet",
+            data=st.session_state["filelist_excel_bytes"],
+            file_name="file_names.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            use_container_width=True,
+        )
+
+
 def get_tools() -> list[ToolDefinition]:
     return [
         ToolDefinition(
@@ -1758,6 +1941,13 @@ def get_tools() -> list[ToolDefinition]:
             category="Documents",
             description="Compare two snapshots of a spreadsheet (.xlsx or .csv). Match rows by a key column; report new, removed, and changed rows; ignore formatting-only differences.",
             render=render_spreadsheet_compare,
+        ),
+        ToolDefinition(
+            tool_id="file-name-lister",
+            name="File Name Lister",
+            category="Documents",
+            description="Upload a file or a whole folder and download a spreadsheet listing every file name, type, and size.",
+            render=render_file_name_lister,
         ),
     ]
 
