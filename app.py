@@ -1919,6 +1919,399 @@ def render_file_name_lister() -> None:
         )
 
 
+# ============================================================================
+# Account Document Builder — Resolution Law Tools
+# Upload a batch of files (or a whole "Doc Builder" folder). The tool reads the
+# account number from each file (from an "Acct#####" token in the file name or
+# from an account-number folder such as 16638/Images/...), groups every file by
+# account, then merges each account's files into ONE combined PDF named
+# "<account>final.pdf" (complaint letter first, then supporting documents).
+# Excel and image files are converted to PDF pages before merging.
+# ============================================================================
+ACCT_IN_NAME = re.compile(r"Acct[\s_\-]*([0-9]{3,7})", re.IGNORECASE)
+ACCT_FOLDER_SEGMENT = re.compile(r"^[0-9]{3,7}$")
+LETTER_HINT = re.compile(r"Ltr[\s_\-]*[0-9]+", re.IGNORECASE)
+DOCBUILD_PDF_EXTS = {"pdf"}
+DOCBUILD_EXCEL_EXTS = {"xls", "xlsx", "xlsm"}
+DOCBUILD_IMAGE_EXTS = {"png", "jpg", "jpeg", "tif", "tiff", "bmp", "gif"}
+
+
+def _split_relative_name(raw_name: str) -> tuple[list[str], str]:
+    """Return (folder_segments, base_name) from an upload name that may carry a
+    relative path like 'DocBuilder/16638/Images/file.pdf'."""
+    normalized = (raw_name or "").replace("\\", "/")
+    parts = [p for p in normalized.split("/") if p]
+    if not parts:
+        return [], ""
+    return parts[:-1], parts[-1]
+
+
+def _file_extension(base_name: str) -> str:
+    return base_name.rsplit(".", 1)[-1].lower() if "." in base_name else ""
+
+
+def extract_account_number(raw_name: str) -> str | None:
+    """Find the account number for a file: first from an 'Acct#####' token in the
+    file name, otherwise from the nearest all-digits folder segment."""
+    folders, base = _split_relative_name(raw_name)
+    match = ACCT_IN_NAME.search(base)
+    if match:
+        return match.group(1)
+    for segment in reversed(folders):
+        if ACCT_FOLDER_SEGMENT.match(segment):
+            return segment
+    return None
+
+
+def is_letter_file(base_name: str) -> bool:
+    """A complaint letter carries both an Acct token and an Ltr token."""
+    return bool(ACCT_IN_NAME.search(base_name) and LETTER_HINT.search(base_name))
+
+
+def _file_sort_key(base_name: str) -> tuple[int, str]:
+    """Letters first (0), then everything else (1); supporting documents start
+    with a date/timestamp so a plain name sort keeps them chronological."""
+    return (0 if is_letter_file(base_name) else 1, base_name.lower())
+
+
+def _safe_pdf_text(value: str) -> str:
+    """PyMuPDF base-14 fonts are Latin-1; replace anything outside it."""
+    return value.encode("latin-1", "replace").decode("latin-1")
+
+
+def _xls_cell_to_str(value) -> str:
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return "" if value is None else str(value)
+
+
+def _read_spreadsheet_rows(data: bytes, ext: str, max_rows: int = 3000) -> list[tuple[str, list[list[str]]]]:
+    """Return [(sheet_title, rows-of-strings), ...] for a spreadsheet, or []."""
+    sheets: list[tuple[str, list[list[str]]]] = []
+    if ext in {"xlsx", "xlsm"}:
+        wb = _openpyxl.load_workbook(_io.BytesIO(data), data_only=True, read_only=True)
+        for ws in wb.worksheets:
+            rows: list[list[str]] = []
+            for record in ws.iter_rows(values_only=True):
+                rows.append(["" if c is None else str(c) for c in record])
+                if len(rows) >= max_rows:
+                    break
+            sheets.append((ws.title, rows))
+    elif ext == "xls":
+        import xlrd  # type: ignore
+
+        book = xlrd.open_workbook(file_contents=data)
+        for sheet in book.sheets():
+            rows = []
+            for r in range(min(sheet.nrows, max_rows)):
+                rows.append([_xls_cell_to_str(sheet.cell_value(r, c)) for c in range(sheet.ncols)])
+            sheets.append((sheet.name, rows))
+    return sheets
+
+
+def convert_spreadsheet_to_pdf_bytes(data: bytes, base_name: str) -> bytes | None:
+    """Best-effort conversion of a spreadsheet's cell data to a readable PDF.
+    Renders each sheet as monospaced rows with page breaks. Returns None on
+    failure (e.g. .xls support missing or an unreadable file)."""
+    ext = _file_extension(base_name)
+    try:
+        sheets = _read_spreadsheet_rows(data, ext)
+    except Exception:
+        return None
+    if not sheets:
+        return None
+    try:
+        doc = fitz.open()
+        page_w, page_h = 792.0, 612.0  # landscape Letter
+        margin = 36.0
+        line_h = 11.0
+        max_chars = 170
+        for title, rows in sheets:
+            page = doc.new_page(width=page_w, height=page_h)
+            y = margin
+            page.insert_text((margin, y), _safe_pdf_text(f"{base_name} - {title}"), fontsize=10, fontname="hebo")
+            y += line_h * 2
+            if not rows:
+                page.insert_text((margin, y), "(empty sheet)", fontsize=8, fontname="cour")
+                continue
+            for row in rows:
+                line = " | ".join(row)
+                if len(line) > max_chars:
+                    line = line[: max_chars - 3] + "..."
+                if y > page_h - margin:
+                    page = doc.new_page(width=page_w, height=page_h)
+                    y = margin
+                page.insert_text((margin, y), _safe_pdf_text(line), fontsize=8, fontname="cour")
+                y += line_h
+        out = doc.tobytes()
+        doc.close()
+        return out
+    except Exception:
+        return None
+
+
+def convert_image_to_pdf_bytes(data: bytes) -> bytes | None:
+    """Wrap an image file as a single-page PDF."""
+    try:
+        img_doc = fitz.open(stream=data, filetype=None)
+        try:
+            pdf_bytes = img_doc.convert_to_pdf()
+        finally:
+            img_doc.close()
+        return pdf_bytes
+    except Exception:
+        return None
+
+
+@dataclass
+class AccountBuildResult:
+    account: str
+    files_found: int
+    pdfs_merged: int
+    converted: int
+    skipped: int
+    pages: int
+    output_file: str
+    status: str
+
+
+def build_account_final_pdfs(uploaded_files) -> tuple[bytes | None, list[dict], list[str], list[str]]:
+    """Group uploads by account number and merge each account into one PDF.
+
+    Returns (zip_bytes_or_None, result_rows, processing_log, unmatched_names)."""
+    groups: dict[str, list[tuple[str, object]]] = {}
+    unmatched: list[str] = []
+    for uploaded_file in uploaded_files:
+        raw = uploaded_file.name or ""
+        _, base = _split_relative_name(raw)
+        account = extract_account_number(raw)
+        if not account:
+            unmatched.append(base or raw)
+            continue
+        groups.setdefault(account, []).append((base, uploaded_file))
+
+    results: list[dict] = []
+    log: list[str] = []
+    written = 0
+    output = BytesIO()
+
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for account in sorted(groups):
+            items = sorted(groups[account], key=lambda pair: _file_sort_key(pair[0]))
+            merged = fitz.open()
+            pdfs_merged = 0
+            converted = 0
+            skipped = 0
+            for base, uploaded_file in items:
+                ext = _file_extension(base)
+                try:
+                    data = uploaded_file.getvalue()
+                except Exception as exc:
+                    skipped += 1
+                    log.append(f"{account}: skipped {base} (could not read upload: {exc})")
+                    continue
+
+                pdf_bytes: bytes | None = None
+                if ext in DOCBUILD_PDF_EXTS:
+                    pdf_bytes = data
+                elif ext in DOCBUILD_EXCEL_EXTS:
+                    pdf_bytes = convert_spreadsheet_to_pdf_bytes(data, base)
+                    if pdf_bytes is not None:
+                        converted += 1
+                    else:
+                        skipped += 1
+                        log.append(f"{account}: skipped {base} (could not convert spreadsheet to PDF)")
+                elif ext in DOCBUILD_IMAGE_EXTS:
+                    pdf_bytes = convert_image_to_pdf_bytes(data)
+                    if pdf_bytes is not None:
+                        converted += 1
+                    else:
+                        skipped += 1
+                        log.append(f"{account}: skipped {base} (could not convert image to PDF)")
+                else:
+                    skipped += 1
+                    log.append(f"{account}: skipped {base} (unsupported file type '.{ext}')")
+
+                if pdf_bytes is None:
+                    continue
+
+                try:
+                    src = fitz.open(stream=pdf_bytes, filetype="pdf")
+                    try:
+                        merged.insert_pdf(src)
+                    finally:
+                        src.close()
+                    pdfs_merged += 1
+                except Exception as exc:
+                    skipped += 1
+                    log.append(f"{account}: skipped {base} (merge error: {exc})")
+
+            page_count = merged.page_count
+            if page_count > 0:
+                out_name = f"{account}final.pdf"
+                archive.writestr(f"{account}/{out_name}", merged.tobytes())
+                written += 1
+                status = "OK"
+            else:
+                out_name = "(none)"
+                status = "No PDF pages produced"
+            merged.close()
+
+            results.append(
+                {
+                    "Account": account,
+                    "Files Found": len(items),
+                    "PDFs Merged": pdfs_merged,
+                    "Converted": converted,
+                    "Skipped": skipped,
+                    "Pages": page_count,
+                    "Output File": out_name,
+                    "Status": status,
+                }
+            )
+
+    if written == 0:
+        return None, results, log, unmatched
+    return output.getvalue(), results, log, unmatched
+
+
+def render_account_doc_builder() -> None:
+    st.markdown(
+        """
+        <div class="hub-hero">
+            <h1>Account Document Builder</h1>
+            <p>Upload your files or whole Doc Builder folder. The tool sorts every file by account number and merges each account into one combined PDF named &lt;account&gt;final.pdf.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("How it works", expanded=True):
+        st.markdown(
+            "- Upload individual files, several files, or an entire account folder.\n"
+            "- The account number is read from an **Acct#####** token in the file name "
+            "(such as `..._Acct16638_Ltr31648.pdf`) or from an **account-number folder** "
+            "(such as `16638/Images/...`).\n"
+            "- Every file is sorted into its account, then merged into one PDF named "
+            "**`<account>final.pdf`** - the complaint letter first, then supporting "
+            "documents in date order.\n"
+            "- PDFs are merged directly. Excel and image files are converted to PDF pages "
+            "first. Anything that can't be converted is listed in the processing log.\n"
+            "- You get a single ZIP: one folder per account, each containing its "
+            "`<account>final.pdf`."
+        )
+
+    st.markdown('<div class="section-label">Upload Files</div>', unsafe_allow_html=True)
+    upload_tabs = st.tabs(["Single or multiple files", "Folder of files"])
+    with upload_tabs[0]:
+        file_uploads = st.file_uploader(
+            "Choose one file or several files",
+            accept_multiple_files=True,
+            help="Letters and supporting documents. Account numbers are read from names like 'Acct16638'.",
+            key="docbuild_file_uploads",
+        )
+    with upload_tabs[1]:
+        folder_uploads = st.file_uploader(
+            "Choose a folder",
+            accept_multiple_files="directory",
+            help="Upload a whole Doc Builder folder; account-number subfolders are detected automatically.",
+            key="docbuild_folder_uploads",
+        )
+
+    uploaded_files = list(file_uploads or []) + list(folder_uploads or [])
+    upload_signature = uploaded_files_signature(uploaded_files)
+    if st.session_state.get("docbuild_upload_signature") != upload_signature:
+        st.session_state["docbuild_upload_signature"] = upload_signature
+        st.session_state["docbuild_zip_bytes"] = None
+        st.session_state["docbuild_results"] = []
+        st.session_state["docbuild_log"] = []
+        st.session_state["docbuild_unmatched"] = []
+
+    if not uploaded_files:
+        left, right = st.columns(2)
+        with left:
+            st.markdown(
+                """
+                <div class="tool-card">
+                    <h3>What it does</h3>
+                    <p>Sorts a pile of files by account number and builds one combined PDF per account, named &lt;account&gt;final.pdf.</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with right:
+            st.markdown(
+                """
+                <div class="tool-card">
+                    <h3>Letter first</h3>
+                    <p>Each account's complaint letter leads, followed by its supporting documents in date order. Excel and images are converted to PDF.</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        return
+
+    preview_groups: dict[str, int] = {}
+    preview_unmatched = 0
+    for uploaded_file in uploaded_files:
+        account = extract_account_number(uploaded_file.name or "")
+        if account:
+            preview_groups[account] = preview_groups.get(account, 0) + 1
+        else:
+            preview_unmatched += 1
+
+    st.markdown(
+        f"""
+        <div class="metric-strip">
+            <div class="metric-box"><strong>{len(uploaded_files)}</strong><span>file(s) uploaded</span></div>
+            <div class="metric-box"><strong>{len(preview_groups)}</strong><span>account(s) detected</span></div>
+            <div class="metric-box"><strong>{preview_unmatched}</strong><span>file(s) with no account</span></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if st.button("Build Combined PDFs", type="primary", use_container_width=True):
+        with st.spinner("Sorting files and building combined PDFs..."):
+            try:
+                zip_bytes, results, log, unmatched = build_account_final_pdfs(uploaded_files)
+                st.session_state["docbuild_zip_bytes"] = zip_bytes
+                st.session_state["docbuild_results"] = results
+                st.session_state["docbuild_log"] = log
+                st.session_state["docbuild_unmatched"] = unmatched
+            except Exception as exc:
+                st.session_state["docbuild_zip_bytes"] = None
+                st.error(f"Could not build the combined PDFs: {exc}")
+
+    results = st.session_state.get("docbuild_results") or []
+    if results:
+        st.subheader("Results by Account")
+        st.dataframe(results, use_container_width=True, hide_index=True)
+
+    unmatched = st.session_state.get("docbuild_unmatched") or []
+    if unmatched:
+        with st.expander(f"Files with no account number ({len(unmatched)}) - not included", expanded=False):
+            for name in unmatched:
+                st.markdown(f"- {name}")
+
+    log = st.session_state.get("docbuild_log") or []
+    if log:
+        with st.expander(f"Processing log ({len(log)} note(s))", expanded=False):
+            for entry in log:
+                st.markdown(f"- {entry}")
+
+    if st.session_state.get("docbuild_zip_bytes"):
+        st.success("Your combined account PDFs are ready.")
+        st.download_button(
+            "Download Combined PDFs (ZIP)",
+            data=st.session_state["docbuild_zip_bytes"],
+            file_name="account_final_pdfs.zip",
+            mime="application/zip",
+            type="primary",
+            use_container_width=True,
+        )
+
+
 def get_tools() -> list[ToolDefinition]:
     return [
         ToolDefinition(
@@ -1941,6 +2334,13 @@ def get_tools() -> list[ToolDefinition]:
             category="Documents",
             description="Compare two snapshots of a spreadsheet (.xlsx or .csv). Match rows by a key column; report new, removed, and changed rows; ignore formatting-only differences.",
             render=render_spreadsheet_compare,
+        ),
+        ToolDefinition(
+            tool_id="account-doc-builder",
+            name="Account Document Builder",
+            category="PDF",
+            description="Sort uploaded files by account number and merge each account into one combined PDF named <account>final.pdf (letter first, then supporting documents).",
+            render=render_account_doc_builder,
         ),
         ToolDefinition(
             tool_id="file-name-lister",
