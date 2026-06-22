@@ -2342,47 +2342,114 @@ class AccountBuildResult:
     status: str
 
 
-def build_account_final_pdfs(uploaded_files) -> tuple[bytes | None, list[dict], list[str], list[str]]:
-    """Group uploads by account number and merge each account into one PDF.
+def _longest_common_folder_prefix(seglists: list[list[str]]) -> list[str]:
+    """Longest shared leading folder segments across all uploads (used to strip a
+    wrapping upload folder so the real sub-folders are detected correctly)."""
+    seglists = [s for s in seglists]
+    if not seglists:
+        return []
+    prefix = list(seglists[0])
+    for segs in seglists[1:]:
+        i = 0
+        while i < len(prefix) and i < len(segs) and prefix[i] == segs[i]:
+            i += 1
+        prefix = prefix[:i]
+        if not prefix:
+            break
+    return prefix
 
-    Returns (zip_bytes_or_None, result_rows, processing_log, unmatched_names)."""
-    groups: dict[str, list[tuple[str, object]]] = {}
-    unmatched: list[str] = []
+
+def _extract_group_number(name: str) -> str | None:
+    """Pull an account-style number from a file name: an 'Acct####' token first,
+    otherwise the longest standalone run of >=3 digits."""
+    m = ACCT_IN_NAME.search(name)
+    if m:
+        return m.group(1)
+    runs = re.findall(r"(?<!\d)(\d{3,})(?!\d)", name)
+    if runs:
+        return max(runs, key=len)
+    return None
+
+
+def _match_folder_for_loose(base_name: str, folder_names) -> str | None:
+    """Find the sub-folder whose name appears as a standalone token in an outside
+    file's name (e.g. folder '16638' matches 'Letter..._Acct16638_Ltr.pdf')."""
+    matches = []
+    for fn in folder_names:
+        if fn.isdigit():
+            if re.search(r"(?<!\d)" + re.escape(fn) + r"(?!\d)", base_name):
+                matches.append(fn)
+        elif re.search(r"(?<![A-Za-z0-9])" + re.escape(fn) + r"(?![A-Za-z0-9])", base_name, re.I):
+            matches.append(fn)
+    if not matches:
+        return None
+    matches.sort(key=len, reverse=True)  # most specific (longest) wins
+    return matches[0]
+
+
+def build_account_final_pdfs(uploaded_files) -> tuple[bytes | None, list[dict], list[str], list[str]]:
+    """Build one combined PDF per sub-folder.
+
+    Grouping is folder-driven: every file INSIDE a sub-folder is combined for that
+    folder, and any file OUTSIDE the sub-folders is prepended to the FRONT of the
+    matching folder's PDF (matched by the folder's number appearing in the outside
+    file's name). Output files are named <folder>final.pdf and placed flat in the
+    ZIP. Returns (zip_bytes_or_None, result_rows, processing_log, unmatched_names)."""
+    # Strip any common wrapping folder so the true sub-folders are detected.
+    seglists = [_split_relative_name(uf.name or "")[0] for uf in uploaded_files]
+    root_len = len(_longest_common_folder_prefix(seglists))
+
+    inside: dict[str, list[tuple[str, object]]] = {}   # folder -> files inside it
+    loose: list[tuple[str, object]] = []               # files outside any sub-folder
     for uploaded_file in uploaded_files:
-        raw = uploaded_file.name or ""
-        _, base = _split_relative_name(raw)
-        account = extract_account_number(raw)
-        if not account:
-            unmatched.append(base or raw)
-            continue
-        groups.setdefault(account, []).append((base, uploaded_file))
+        folders, base = _split_relative_name(uploaded_file.name or "")
+        stripped = folders[root_len:]
+        if stripped:
+            inside.setdefault(stripped[0], []).append((base, uploaded_file))
+        else:
+            loose.append((base, uploaded_file))
+
+    folder_names = set(inside.keys())
+
+    # Place each outside file at the FRONT of its matching folder (or, if it
+    # matches no folder, give it its own combined PDF so nothing is lost).
+    front: dict[str, list[tuple[str, object]]] = {}
+    group_names = set(folder_names)
+    for base, uploaded_file in loose:
+        group = _match_folder_for_loose(base, folder_names)
+        if group is None:
+            group = _extract_group_number(base) or sanitize_filename_stem(base, "document")
+        front.setdefault(group, []).append((base, uploaded_file))
+        group_names.add(group)
 
     results: list[dict] = []
     log: list[str] = []
+    unmatched: list[str] = []
     written = 0
     output = BytesIO()
 
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for account in sorted(groups):
-            items = sorted(groups[account], key=lambda pair: _file_sort_key(pair[0]))
+        for group in sorted(group_names):
+            front_items = sorted(front.get(group, []), key=lambda pair: pair[0].lower())
+            body_items = sorted(inside.get(group, []), key=lambda pair: pair[0].lower())
+            items = front_items + body_items  # outside files first, then folder files
+
             merged = fitz.open()
             pdfs_merged = 0
             converted = 0
             skipped = 0
             placeholders = 0
-            # Read every file, expanding any .zip archives, then keep the
-            # complaint letter(s) first and supporting documents in date order.
+
+            # Read every file, expanding any .zip archives, preserving order.
             flat: list[tuple[str, bytes]] = []
             for base, uploaded_file in items:
                 try:
                     data = uploaded_file.getvalue()
                 except Exception as exc:
                     skipped += 1
-                    log.append(f"{account}: skipped {base} (could not read upload: {exc})")
+                    log.append(f"{group}: skipped {base} (could not read upload: {exc})")
                     continue
                 flat.extend(_expand_uploads(base, data))
-
-            flat.sort(key=lambda pair: _file_sort_key(pair[0].split(" > ")[-1]))
 
             def _add_placeholder(display_name: str, note: str) -> None:
                 """Insert a labeled placeholder page so a file is never dropped."""
@@ -2390,7 +2457,7 @@ def build_account_final_pdfs(uploaded_files) -> tuple[bytes | None, list[dict], 
                 ph = _make_placeholder_pdf_bytes(display_name, note)
                 if ph is None:
                     skipped += 1
-                    log.append(f"{account}: skipped {display_name} ({note})")
+                    log.append(f"{group}: skipped {display_name} ({note})")
                     return
                 try:
                     ph_doc = fitz.open(stream=ph, filetype="pdf")
@@ -2399,10 +2466,10 @@ def build_account_final_pdfs(uploaded_files) -> tuple[bytes | None, list[dict], 
                     finally:
                         ph_doc.close()
                     placeholders += 1
-                    log.append(f"{account}: placeholder page added for {display_name} ({note})")
+                    log.append(f"{group}: placeholder page added for {display_name} ({note})")
                 except Exception:
                     skipped += 1
-                    log.append(f"{account}: skipped {display_name} ({note})")
+                    log.append(f"{group}: skipped {display_name} ({note})")
 
             for name, data in flat:
                 effective = name.split(" > ")[-1]
@@ -2432,9 +2499,10 @@ def build_account_final_pdfs(uploaded_files) -> tuple[bytes | None, list[dict], 
                         src.close()
                 except Exception:
                     _add_placeholder(name, "Source file is empty or corrupt - included as a placeholder")
+
             page_count = merged.page_count
             if page_count > 0:
-                out_name = f"{account}final.pdf"
+                out_name = f"{group}final.pdf"
                 archive.writestr(out_name, merged.tobytes())
                 written += 1
                 status = "OK"
@@ -2445,8 +2513,9 @@ def build_account_final_pdfs(uploaded_files) -> tuple[bytes | None, list[dict], 
 
             results.append(
                 {
-                    "Account": account,
-                    "Files Found": len(items),
+                    "Account": group,
+                    "Outside (front)": len(front.get(group, [])),
+                    "In folder": len(inside.get(group, [])),
                     "PDFs Merged": pdfs_merged,
                     "Converted": converted,
                     "Placeholders": placeholders,
