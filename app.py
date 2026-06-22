@@ -2175,11 +2175,11 @@ def build_account_final_pdfs(uploaded_files) -> tuple[bytes | None, list[dict], 
     return output.getvalue(), results, log, unmatched
 
 
-def render_account_doc_builder() -> None:
+def render_file_combiner() -> None:
     st.markdown(
         """
         <div class="hub-hero">
-            <h1>Account Document Builder</h1>
+            <h1>File Combiner</h1>
             <p>Upload your files or whole Doc Builder folder. The tool sorts every file by account number and merges each account into one combined PDF named &lt;account&gt;final.pdf.</p>
         </div>
         """,
@@ -2336,11 +2336,11 @@ def get_tools() -> list[ToolDefinition]:
             render=render_spreadsheet_compare,
         ),
         ToolDefinition(
-            tool_id="account-doc-builder",
-            name="Account Document Builder",
+            tool_id="file-combiner",
+            name="File Combiner",
             category="PDF",
             description="Sort uploaded files by account number and merge each account into one combined PDF named <account>final.pdf (letter first, then supporting documents).",
-            render=render_account_doc_builder,
+            render=render_file_combiner,
         ),
         ToolDefinition(
             tool_id="file-name-lister",
