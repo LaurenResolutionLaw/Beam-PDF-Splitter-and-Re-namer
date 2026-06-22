@@ -2099,15 +2099,17 @@ def _render_rows_to_pdf_bytes(sheets, base_name: str) -> bytes | None:
         return None
 
 
-def _html_string_to_pdf_bytes(html: str) -> bytes | None:
-    """Render an HTML string to a paginated PDF using PyMuPDF's Story engine."""
+def _html_string_to_pdf_bytes(html: str, landscape: bool = False) -> bytes | None:
+    """Render an HTML string to a paginated PDF using PyMuPDF's Story engine.
+    The Story engine wraps long cell text and paginates automatically, so no
+    data is ever cut off the page."""
     if not html:
         html = "<p>(empty document)</p>"
     try:
         story = fitz.Story(html=html)
         buf = BytesIO()
         writer = fitz.DocumentWriter(buf)
-        mediabox = fitz.paper_rect("letter")
+        mediabox = fitz.paper_rect("letter-l" if landscape else "letter")
         where = mediabox + (36, 36, -36, -36)
         more = 1
         while more:
@@ -2121,9 +2123,70 @@ def _html_string_to_pdf_bytes(html: str) -> bytes | None:
         return None
 
 
+def _spreadsheet_to_html_table(sheets, base_name: str, max_cols_per_block: int = 7) -> str:
+    """Build styled, bordered HTML tables from spreadsheet rows. Every column and
+    row is included. Sheets wider than max_cols_per_block are split into column
+    blocks (the first column repeats in each block for context) so that even very
+    wide spreadsheets fit the page and no column is clipped or cut off."""
+    import html as _html
+
+    css = (
+        "<style>"
+        "h3{font-family:Helvetica,Arial,sans-serif;font-size:11px;margin:8px 0 4px 0;}"
+        "h4{font-family:Helvetica,Arial,sans-serif;font-size:8.5px;color:#444;margin:8px 0 3px 0;}"
+        "table{border-collapse:collapse;width:100%;font-family:Helvetica,Arial,sans-serif;font-size:8px;}"
+        "th,td{border:1px solid #9aa0a6;padding:3px 4px;text-align:left;vertical-align:top;}"
+        "th{background-color:#1565C0;color:#ffffff;font-weight:bold;}"
+        "tr:nth-child(even) td{background-color:#f2f5fa;}"
+        "</style>"
+    )
+
+    def esc(v):
+        return _html.escape(str(v))
+
+    def render_block(header, body, col_indices):
+        out = ["<table>"]
+        out.append("<tr>" + "".join(f"<th>{esc(header[c])}</th>" for c in col_indices) + "</tr>")
+        for row in body:
+            out.append("<tr>" + "".join(f"<td>{esc(row[c])}</td>" for c in col_indices) + "</tr>")
+        out.append("</table>")
+        return "".join(out)
+
+    parts = [css]
+    for title, rows in sheets:
+        parts.append(f"<h3>{esc(base_name)} &mdash; {esc(title)}</h3>")
+        if not rows:
+            parts.append("<p>(empty sheet)</p>")
+            continue
+        ncols = max((len(r) for r in rows), default=0)
+        if ncols == 0:
+            parts.append("<p>(empty sheet)</p>")
+            continue
+        padded = [list(r) + [""] * (ncols - len(r)) for r in rows]
+        header, body = padded[0], padded[1:]
+
+        if ncols <= max_cols_per_block:
+            parts.append(render_block(header, body, list(range(ncols))))
+            continue
+
+        # Wide sheet: split into column blocks, repeating column 0 for context.
+        rest = list(range(1, ncols))
+        per_block = max(1, max_cols_per_block - 1)
+        blocks = [rest[i:i + per_block] for i in range(0, len(rest), per_block)]
+        for n, block in enumerate(blocks, start=1):
+            col_indices = [0] + block
+            first, last = block[0] + 1, block[-1] + 1
+            parts.append(
+                f"<h4>Columns 1 and {first}-{last} of {ncols} (block {n} of {len(blocks)})</h4>"
+            )
+            parts.append(render_block(header, body, col_indices))
+    return "".join(parts)
+
+
 def convert_spreadsheet_to_pdf_bytes(data: bytes, base_name: str) -> bytes | None:
-    """Spreadsheet -> PDF. LibreOffice first (formatted); else a pure-Python text
-    rendering of the cell data (openpyxl for .xlsx/.xlsm, xlrd for legacy .xls)."""
+    """Spreadsheet -> PDF. LibreOffice first when available; otherwise render the
+    full cell data as a nicely formatted, bordered table (landscape, wrapping,
+    auto-paginated) so every value is included and nothing is cut off."""
     via_office = convert_office_to_pdf_via_libreoffice(data, base_name)
     if via_office is not None:
         return via_office
@@ -2132,7 +2195,32 @@ def convert_spreadsheet_to_pdf_bytes(data: bytes, base_name: str) -> bytes | Non
         sheets = _read_spreadsheet_rows(data, ext)
     except Exception:
         return None
-    return _render_rows_to_pdf_bytes(sheets, base_name)
+    if not sheets:
+        return None
+    table_pdf = _html_string_to_pdf_bytes(_spreadsheet_to_html_table(sheets, base_name), landscape=True)
+    if table_pdf is not None:
+        return table_pdf
+    return _render_rows_to_pdf_bytes(sheets, base_name)  # last-resort monospaced text
+
+
+def _make_placeholder_pdf_bytes(title: str, note: str) -> bytes | None:
+    """Create a single-page PDF noting a file that could not be merged, so it is
+    still represented (in order) inside the combined account PDF."""
+    try:
+        doc = fitz.open()
+        page = doc.new_page(width=612, height=792)
+        page.insert_text((72, 96), _safe_pdf_text(title), fontsize=12, fontname="hebo")
+        wrapped = _safe_pdf_text(note)
+        rect = fitz.Rect(72, 120, 540, 300)
+        try:
+            page.insert_textbox(rect, wrapped, fontsize=10, fontname="helv")
+        except Exception:
+            page.insert_text((72, 130), wrapped[:120], fontsize=10, fontname="helv")
+        out = doc.tobytes()
+        doc.close()
+        return out
+    except Exception:
+        return None
 
 
 def convert_html_to_pdf_bytes(data: bytes, base_name: str) -> bytes | None:
@@ -2281,6 +2369,7 @@ def build_account_final_pdfs(uploaded_files) -> tuple[bytes | None, list[dict], 
             pdfs_merged = 0
             converted = 0
             skipped = 0
+            placeholders = 0
             # Read every file, expanding any .zip archives, then keep the
             # complaint letter(s) first and supporting documents in date order.
             flat: list[tuple[str, bytes]] = []
@@ -2295,37 +2384,54 @@ def build_account_final_pdfs(uploaded_files) -> tuple[bytes | None, list[dict], 
 
             flat.sort(key=lambda pair: _file_sort_key(pair[0].split(" > ")[-1]))
 
+            def _add_placeholder(display_name: str, note: str) -> None:
+                """Insert a labeled placeholder page so a file is never dropped."""
+                nonlocal placeholders, skipped
+                ph = _make_placeholder_pdf_bytes(display_name, note)
+                if ph is None:
+                    skipped += 1
+                    log.append(f"{account}: skipped {display_name} ({note})")
+                    return
+                try:
+                    ph_doc = fitz.open(stream=ph, filetype="pdf")
+                    try:
+                        merged.insert_pdf(ph_doc)
+                    finally:
+                        ph_doc.close()
+                    placeholders += 1
+                    log.append(f"{account}: placeholder page added for {display_name} ({note})")
+                except Exception:
+                    skipped += 1
+                    log.append(f"{account}: skipped {display_name} ({note})")
+
             for name, data in flat:
                 effective = name.split(" > ")[-1]
                 pdf_bytes, status = convert_to_pdf_bytes(data, effective)
                 if status == "converted":
                     converted += 1
                 elif status == "unsupported":
-                    skipped += 1
-                    log.append(f"{account}: skipped {name} (unsupported file type '.{_file_extension(effective)}')")
+                    _add_placeholder(name, f"Unsupported file type '.{_file_extension(effective)}' - included as a placeholder")
                     continue
                 elif status == "failed":
-                    skipped += 1
-                    log.append(f"{account}: skipped {name} (could not convert to PDF)")
+                    _add_placeholder(name, "Could not convert to PDF - included as a placeholder")
                     continue
 
                 if pdf_bytes is None:
+                    _add_placeholder(name, "No content could be read - included as a placeholder")
                     continue
 
                 try:
                     src = fitz.open(stream=pdf_bytes, filetype="pdf")
                     try:
                         if src.page_count == 0:
-                            skipped += 1
-                            log.append(f"{account}: skipped {name} (source PDF is empty or corrupt - 0 pages)")
-                            continue
-                        merged.insert_pdf(src)
+                            _add_placeholder(name, "Source PDF is empty or corrupt (0 pages) - included as a placeholder")
+                        else:
+                            merged.insert_pdf(src)
+                            pdfs_merged += 1
                     finally:
                         src.close()
-                    pdfs_merged += 1
                 except Exception:
-                    skipped += 1
-                    log.append(f"{account}: skipped {name} (source file is empty or corrupt - could not be read as a PDF)")
+                    _add_placeholder(name, "Source file is empty or corrupt - included as a placeholder")
             page_count = merged.page_count
             if page_count > 0:
                 out_name = f"{account}final.pdf"
@@ -2343,6 +2449,7 @@ def build_account_final_pdfs(uploaded_files) -> tuple[bytes | None, list[dict], 
                     "Files Found": len(items),
                     "PDFs Merged": pdfs_merged,
                     "Converted": converted,
+                    "Placeholders": placeholders,
                     "Skipped": skipped,
                     "Pages": page_count,
                     "Output File": out_name,
