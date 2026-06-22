@@ -5,7 +5,9 @@ import importlib.util
 import os
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 import zipfile
 from dataclasses import asdict, dataclass
 from io import BytesIO
@@ -2009,15 +2011,67 @@ def _read_spreadsheet_rows(data: bytes, ext: str, max_rows: int = 3000) -> list[
     return sheets
 
 
-def convert_spreadsheet_to_pdf_bytes(data: bytes, base_name: str) -> bytes | None:
-    """Best-effort conversion of a spreadsheet's cell data to a readable PDF.
-    Renders each sheet as monospaced rows with page breaks. Returns None on
-    failure (e.g. .xls support missing or an unreadable file)."""
-    ext = _file_extension(base_name)
+_LIBREOFFICE_BIN_CACHE: list = []
+
+
+def _find_libreoffice_binary() -> str | None:
+    """Locate a LibreOffice/soffice executable, if one is installed."""
+    if _LIBREOFFICE_BIN_CACHE:
+        return _LIBREOFFICE_BIN_CACHE[0] or None
+    found = None
+    for name in ("libreoffice", "soffice"):
+        path = shutil.which(name)
+        if path:
+            found = path
+            break
+    _LIBREOFFICE_BIN_CACHE.append(found or "")
+    return found
+
+
+def convert_office_to_pdf_via_libreoffice(data: bytes, base_name: str) -> bytes | None:
+    """Convert any office file (xls, xlsx, doc, docx, ...) to a properly
+    formatted PDF using a headless LibreOffice, if it is available. Returns
+    None if LibreOffice is not installed or the conversion fails."""
+    soffice = _find_libreoffice_binary()
+    if not soffice:
+        return None
+    ext = _file_extension(base_name) or "xls"
     try:
-        sheets = _read_spreadsheet_rows(data, ext)
+        with tempfile.TemporaryDirectory() as tmp:
+            src_path = os.path.join(tmp, f"input.{ext}")
+            with open(src_path, "wb") as fh:
+                fh.write(data)
+            profile = "file://" + os.path.join(tmp, "lo_profile")
+            proc = subprocess.run(
+                [
+                    soffice,
+                    "--headless",
+                    "--norestore",
+                    "--nolockcheck",
+                    "--nodefault",
+                    f"-env:UserInstallation={profile}",
+                    "--convert-to",
+                    "pdf",
+                    "--outdir",
+                    tmp,
+                    src_path,
+                ],
+                capture_output=True,
+                timeout=180,
+            )
+            for fname in os.listdir(tmp):
+                if fname.lower().endswith(".pdf"):
+                    with open(os.path.join(tmp, fname), "rb") as fh:
+                        out = fh.read()
+                    if out:
+                        return out
+            return None
     except Exception:
         return None
+
+
+def _render_rows_to_pdf_bytes(sheets, base_name: str) -> bytes | None:
+    """Fallback renderer: draw spreadsheet rows as monospaced text pages."""
     if not sheets:
         return None
     try:
@@ -2048,6 +2102,21 @@ def convert_spreadsheet_to_pdf_bytes(data: bytes, base_name: str) -> bytes | Non
         return out
     except Exception:
         return None
+
+
+def convert_spreadsheet_to_pdf_bytes(data: bytes, base_name: str) -> bytes | None:
+    """Convert a spreadsheet to PDF. Prefers LibreOffice for a properly
+    formatted result; falls back to a pure-Python text rendering of the cell
+    data (openpyxl for .xlsx/.xlsm, xlrd for legacy .xls)."""
+    via_office = convert_office_to_pdf_via_libreoffice(data, base_name)
+    if via_office is not None:
+        return via_office
+    ext = _file_extension(base_name)
+    try:
+        sheets = _read_spreadsheet_rows(data, ext)
+    except Exception:
+        return None
+    return _render_rows_to_pdf_bytes(sheets, base_name)
 
 
 def convert_image_to_pdf_bytes(data: bytes) -> bytes | None:
