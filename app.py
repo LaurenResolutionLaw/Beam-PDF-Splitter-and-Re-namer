@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import hashlib
@@ -1936,6 +1937,9 @@ LETTER_HINT = re.compile(r"Ltr[\s_\-]*[0-9]+", re.IGNORECASE)
 DOCBUILD_PDF_EXTS = {"pdf"}
 DOCBUILD_EXCEL_EXTS = {"xls", "xlsx", "xlsm"}
 DOCBUILD_IMAGE_EXTS = {"png", "jpg", "jpeg", "tif", "tiff", "bmp", "gif"}
+DOCBUILD_HTML_EXTS = {"html", "htm"}
+DOCBUILD_WORD_EXTS = {"doc", "docx"}
+DOCBUILD_ARCHIVE_EXTS = {"zip"}
 
 
 def _split_relative_name(raw_name: str) -> tuple[list[str], str]:
@@ -2029,35 +2033,27 @@ def _find_libreoffice_binary() -> str | None:
 
 
 def convert_office_to_pdf_via_libreoffice(data: bytes, base_name: str) -> bytes | None:
-    """Convert any office file (xls, xlsx, doc, docx, ...) to a properly
-    formatted PDF using a headless LibreOffice, if it is available. Returns
-    None if LibreOffice is not installed or the conversion fails."""
+    """Convert any office file (xls, xlsx, doc, docx, html, ...) to a properly
+    formatted PDF using a headless LibreOffice, if it is available. Returns None
+    if LibreOffice is not installed or the conversion fails. This is the highest
+    fidelity path; pure-Python fallbacks below run when it is unavailable."""
     soffice = _find_libreoffice_binary()
     if not soffice:
         return None
-    ext = _file_extension(base_name) or "xls"
+    ext = _file_extension(base_name) or "bin"
     try:
         with tempfile.TemporaryDirectory() as tmp:
             src_path = os.path.join(tmp, f"input.{ext}")
             with open(src_path, "wb") as fh:
                 fh.write(data)
             profile = "file://" + os.path.join(tmp, "lo_profile")
-            proc = subprocess.run(
+            subprocess.run(
                 [
-                    soffice,
-                    "--headless",
-                    "--norestore",
-                    "--nolockcheck",
-                    "--nodefault",
+                    soffice, "--headless", "--norestore", "--nolockcheck", "--nodefault",
                     f"-env:UserInstallation={profile}",
-                    "--convert-to",
-                    "pdf",
-                    "--outdir",
-                    tmp,
-                    src_path,
+                    "--convert-to", "pdf", "--outdir", tmp, src_path,
                 ],
-                capture_output=True,
-                timeout=180,
+                capture_output=True, timeout=180,
             )
             for fname in os.listdir(tmp):
                 if fname.lower().endswith(".pdf"):
@@ -2104,10 +2100,31 @@ def _render_rows_to_pdf_bytes(sheets, base_name: str) -> bytes | None:
         return None
 
 
+def _html_string_to_pdf_bytes(html: str) -> bytes | None:
+    """Render an HTML string to a paginated PDF using PyMuPDF's Story engine."""
+    if not html:
+        html = "<p>(empty document)</p>"
+    try:
+        story = fitz.Story(html=html)
+        buf = BytesIO()
+        writer = fitz.DocumentWriter(buf)
+        mediabox = fitz.paper_rect("letter")
+        where = mediabox + (36, 36, -36, -36)
+        more = 1
+        while more:
+            device = writer.begin_page(mediabox)
+            more, _ = story.place(where)
+            story.draw(device)
+            writer.end_page()
+        writer.close()
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
 def convert_spreadsheet_to_pdf_bytes(data: bytes, base_name: str) -> bytes | None:
-    """Convert a spreadsheet to PDF. Prefers LibreOffice for a properly
-    formatted result; falls back to a pure-Python text rendering of the cell
-    data (openpyxl for .xlsx/.xlsm, xlrd for legacy .xls)."""
+    """Spreadsheet -> PDF. LibreOffice first (formatted); else a pure-Python text
+    rendering of the cell data (openpyxl for .xlsx/.xlsm, xlrd for legacy .xls)."""
     via_office = convert_office_to_pdf_via_libreoffice(data, base_name)
     if via_office is not None:
         return via_office
@@ -2119,8 +2136,57 @@ def convert_spreadsheet_to_pdf_bytes(data: bytes, base_name: str) -> bytes | Non
     return _render_rows_to_pdf_bytes(sheets, base_name)
 
 
+def convert_html_to_pdf_bytes(data: bytes, base_name: str) -> bytes | None:
+    """HTML -> PDF. LibreOffice first; else PyMuPDF's HTML Story engine."""
+    via_office = convert_office_to_pdf_via_libreoffice(data, base_name)
+    if via_office is not None:
+        return via_office
+    try:
+        html = data.decode("utf-8")
+    except Exception:
+        html = data.decode("latin-1", "replace")
+    return _html_string_to_pdf_bytes(html)
+
+
+def convert_word_to_pdf_bytes(data: bytes, base_name: str) -> bytes | None:
+    """Word -> PDF. LibreOffice first (handles .doc and .docx); else .docx is
+    converted via mammoth (docx -> HTML) and rendered with PyMuPDF."""
+    via_office = convert_office_to_pdf_via_libreoffice(data, base_name)
+    if via_office is not None:
+        return via_office
+    if _file_extension(base_name) == "docx":
+        try:
+            import mammoth  # type: ignore
+
+            html = mammoth.convert_to_html(BytesIO(data)).value
+            return _html_string_to_pdf_bytes(html or "")
+        except Exception:
+            return None
+    return None  # legacy .doc has no pure-Python path
+
+
 def convert_image_to_pdf_bytes(data: bytes) -> bytes | None:
-    """Wrap an image file as a single-page PDF."""
+    """Image -> PDF. Pillow first (handles multi-page TIFF); else PyMuPDF."""
+    try:
+        from PIL import Image  # type: ignore
+
+        img = Image.open(BytesIO(data))
+        frames = getattr(img, "n_frames", 1)
+        pages = []
+        for index in range(frames):
+            try:
+                img.seek(index)
+            except Exception:
+                break
+            pages.append(img.convert("RGB"))
+        if pages:
+            buf = BytesIO()
+            pages[0].save(buf, format="PDF", save_all=True, append_images=pages[1:])
+            out = buf.getvalue()
+            if out:
+                return out
+    except Exception:
+        pass
     try:
         img_doc = fitz.open(stream=data, filetype=None)
         try:
@@ -2130,6 +2196,51 @@ def convert_image_to_pdf_bytes(data: bytes) -> bytes | None:
         return pdf_bytes
     except Exception:
         return None
+
+
+def convert_to_pdf_bytes(data: bytes, base_name: str) -> tuple[bytes | None, str]:
+    """Dispatch a single file to the right converter.
+    Returns (pdf_bytes_or_None, status) where status is one of:
+    'pdf' (already a PDF), 'converted', 'unsupported', 'failed'."""
+    ext = _file_extension(base_name)
+    if ext in DOCBUILD_PDF_EXTS:
+        return data, "pdf"
+    if ext in DOCBUILD_EXCEL_EXTS:
+        out = convert_spreadsheet_to_pdf_bytes(data, base_name)
+        return (out, "converted") if out else (None, "failed")
+    if ext in DOCBUILD_HTML_EXTS:
+        out = convert_html_to_pdf_bytes(data, base_name)
+        return (out, "converted") if out else (None, "failed")
+    if ext in DOCBUILD_WORD_EXTS:
+        out = convert_word_to_pdf_bytes(data, base_name)
+        return (out, "converted") if out else (None, "failed")
+    if ext in DOCBUILD_IMAGE_EXTS:
+        out = convert_image_to_pdf_bytes(data)
+        return (out, "converted") if out else (None, "failed")
+    return None, "unsupported"
+
+
+def _expand_uploads(base_name: str, data: bytes) -> list[tuple[str, bytes]]:
+    """Expand archives into their contained files. A .zip yields one entry per
+    file inside it; everything else yields itself unchanged."""
+    if _file_extension(base_name) not in DOCBUILD_ARCHIVE_EXTS:
+        return [(base_name, data)]
+    try:
+        archive = zipfile.ZipFile(BytesIO(data))
+    except Exception:
+        return [(base_name, data)]
+    entries: list[tuple[str, bytes]] = []
+    for info in archive.infolist():
+        if info.is_dir():
+            continue
+        entry = info.filename.replace("\\", "/").split("/")[-1]
+        if not entry:
+            continue
+        try:
+            entries.append((f"{base_name} > {entry}", archive.read(info)))
+        except Exception:
+            continue
+    return entries or [(base_name, data)]
 
 
 @dataclass
@@ -2171,35 +2282,33 @@ def build_account_final_pdfs(uploaded_files) -> tuple[bytes | None, list[dict], 
             pdfs_merged = 0
             converted = 0
             skipped = 0
+            # Read every file, expanding any .zip archives, then keep the
+            # complaint letter(s) first and supporting documents in date order.
+            flat: list[tuple[str, bytes]] = []
             for base, uploaded_file in items:
-                ext = _file_extension(base)
                 try:
                     data = uploaded_file.getvalue()
                 except Exception as exc:
                     skipped += 1
                     log.append(f"{account}: skipped {base} (could not read upload: {exc})")
                     continue
+                flat.extend(_expand_uploads(base, data))
 
-                pdf_bytes: bytes | None = None
-                if ext in DOCBUILD_PDF_EXTS:
-                    pdf_bytes = data
-                elif ext in DOCBUILD_EXCEL_EXTS:
-                    pdf_bytes = convert_spreadsheet_to_pdf_bytes(data, base)
-                    if pdf_bytes is not None:
-                        converted += 1
-                    else:
-                        skipped += 1
-                        log.append(f"{account}: skipped {base} (could not convert spreadsheet to PDF)")
-                elif ext in DOCBUILD_IMAGE_EXTS:
-                    pdf_bytes = convert_image_to_pdf_bytes(data)
-                    if pdf_bytes is not None:
-                        converted += 1
-                    else:
-                        skipped += 1
-                        log.append(f"{account}: skipped {base} (could not convert image to PDF)")
-                else:
+            flat.sort(key=lambda pair: _file_sort_key(pair[0].split(" > ")[-1]))
+
+            for name, data in flat:
+                effective = name.split(" > ")[-1]
+                pdf_bytes, status = convert_to_pdf_bytes(data, effective)
+                if status == "converted":
+                    converted += 1
+                elif status == "unsupported":
                     skipped += 1
-                    log.append(f"{account}: skipped {base} (unsupported file type '.{ext}')")
+                    log.append(f"{account}: skipped {name} (unsupported file type '.{_file_extension(effective)}')")
+                    continue
+                elif status == "failed":
+                    skipped += 1
+                    log.append(f"{account}: skipped {name} (could not convert to PDF)")
+                    continue
 
                 if pdf_bytes is None:
                     continue
@@ -2207,14 +2316,17 @@ def build_account_final_pdfs(uploaded_files) -> tuple[bytes | None, list[dict], 
                 try:
                     src = fitz.open(stream=pdf_bytes, filetype="pdf")
                     try:
+                        if src.page_count == 0:
+                            skipped += 1
+                            log.append(f"{account}: skipped {name} (source PDF is empty or corrupt - 0 pages)")
+                            continue
                         merged.insert_pdf(src)
                     finally:
                         src.close()
                     pdfs_merged += 1
-                except Exception as exc:
+                except Exception:
                     skipped += 1
-                    log.append(f"{account}: skipped {base} (merge error: {exc})")
-
+                    log.append(f"{account}: skipped {name} (source file is empty or corrupt - could not be read as a PDF)")
             page_count = merged.page_count
             if page_count > 0:
                 out_name = f"{account}final.pdf"
