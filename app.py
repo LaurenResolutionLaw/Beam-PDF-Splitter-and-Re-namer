@@ -2520,6 +2520,14 @@ def build_account_final_pdfs(uploaded_files) -> tuple[bytes | None, list[dict], 
                         if src.page_count == 0:
                             _add_placeholder(name, "Source PDF is empty or corrupt (0 pages) - included as a placeholder")
                         else:
+                            # Flatten interactive content (form fields + annotations) into
+                            # static page content before merging. Without this, widgets and
+                            # annotations carry into the combined PDF and some viewers (e.g.
+                            # Foxit) treat the result as locked / non-editable.
+                            try:
+                                src.bake(annots=True, widgets=True)
+                            except Exception as bake_exc:
+                                log.append(f"{group}: could not flatten {name} before merge ({bake_exc}); merged as-is")
                             merged.insert_pdf(src)
                             pdfs_merged += 1
                     finally:
