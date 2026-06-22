@@ -2387,6 +2387,57 @@ def _match_folder_for_loose(base_name: str, folder_names) -> str | None:
     return matches[0]
 
 
+def _folder_account_key(folder_name: str) -> str:
+    """The group key for a sub-folder: its account number if the folder name
+    contains one (e.g. '16638', '16638 - John Doe', 'Acct16638' all -> '16638'),
+    otherwise the folder name itself."""
+    return _extract_group_number(folder_name) or folder_name
+
+
+def _group_uploads(uploaded_files):
+    """Shared grouping used by both the build and the on-screen preview so their
+    numbers always agree. Files are grouped by the account number of the sub-folder
+    they live in; outside files are matched to a group by the account number in
+    their name. Returns (inside, front, group_names):
+      inside[group] -> list of (base_name, upload) for files inside that folder
+      front[group]  -> list of (base_name, upload) for OUTSIDE files matched to it
+      group_names   -> every group that will become a <group>final.pdf
+    """
+    seglists = [_split_relative_name(uf.name or "")[0] for uf in uploaded_files]
+    root_len = len(_longest_common_folder_prefix(seglists))
+
+    inside: dict[str, list[tuple[str, object]]] = {}
+    loose: list[tuple[str, object]] = []
+    for uploaded_file in uploaded_files:
+        folders, base = _split_relative_name(uploaded_file.name or "")
+        stripped = folders[root_len:]
+        if stripped:
+            key = _folder_account_key(stripped[0])
+            inside.setdefault(key, []).append((base, uploaded_file))
+        else:
+            loose.append((base, uploaded_file))
+
+    account_keys = set(inside.keys())
+    front: dict[str, list[tuple[str, object]]] = {}
+    group_names = set(account_keys)
+    for base, uploaded_file in loose:
+        num = _extract_group_number(base)
+        group = None
+        if num and num in account_keys:
+            group = num
+        if group is None:
+            # fall back: any numeric account key that appears as a token in the name
+            for k in account_keys:
+                if k.isdigit() and re.search(r"(?<!\d)" + re.escape(k) + r"(?!\d)", base):
+                    group = k
+                    break
+        if group is None:
+            group = num or sanitize_filename_stem(base, "document")
+        front.setdefault(group, []).append((base, uploaded_file))
+        group_names.add(group)
+    return inside, front, group_names
+
+
 def build_account_final_pdfs(uploaded_files) -> tuple[bytes | None, list[dict], list[str], list[str]]:
     """Build one combined PDF per sub-folder.
 
@@ -2395,32 +2446,8 @@ def build_account_final_pdfs(uploaded_files) -> tuple[bytes | None, list[dict], 
     matching folder's PDF (matched by the folder's number appearing in the outside
     file's name). Output files are named <folder>final.pdf and placed flat in the
     ZIP. Returns (zip_bytes_or_None, result_rows, processing_log, unmatched_names)."""
-    # Strip any common wrapping folder so the true sub-folders are detected.
-    seglists = [_split_relative_name(uf.name or "")[0] for uf in uploaded_files]
-    root_len = len(_longest_common_folder_prefix(seglists))
-
-    inside: dict[str, list[tuple[str, object]]] = {}   # folder -> files inside it
-    loose: list[tuple[str, object]] = []               # files outside any sub-folder
-    for uploaded_file in uploaded_files:
-        folders, base = _split_relative_name(uploaded_file.name or "")
-        stripped = folders[root_len:]
-        if stripped:
-            inside.setdefault(stripped[0], []).append((base, uploaded_file))
-        else:
-            loose.append((base, uploaded_file))
-
-    folder_names = set(inside.keys())
-
-    # Place each outside file at the FRONT of its matching folder (or, if it
-    # matches no folder, give it its own combined PDF so nothing is lost).
-    front: dict[str, list[tuple[str, object]]] = {}
-    group_names = set(folder_names)
-    for base, uploaded_file in loose:
-        group = _match_folder_for_loose(base, folder_names)
-        if group is None:
-            group = _extract_group_number(base) or sanitize_filename_stem(base, "document")
-        front.setdefault(group, []).append((base, uploaded_file))
-        group_names.add(group)
+    # Folder-driven grouping (shared with the preview so counts always agree).
+    inside, front, group_names = _group_uploads(uploaded_files)
 
     results: list[dict] = []
     log: list[str] = []
@@ -2607,21 +2634,17 @@ def render_file_combiner() -> None:
             )
         return
 
-    preview_groups: dict[str, int] = {}
-    preview_unmatched = 0
-    for uploaded_file in uploaded_files:
-        account = extract_account_number(uploaded_file.name or "")
-        if account:
-            preview_groups[account] = preview_groups.get(account, 0) + 1
-        else:
-            preview_unmatched += 1
+    _inside, _front, _group_names = _group_uploads(uploaded_files)
+    n_in_folders = sum(len(v) for v in _inside.values())
+    n_outside = sum(len(v) for v in _front.values())
 
     st.markdown(
         f"""
         <div class="metric-strip">
             <div class="metric-box"><strong>{len(uploaded_files)}</strong><span>file(s) uploaded</span></div>
-            <div class="metric-box"><strong>{len(preview_groups)}</strong><span>account(s) detected</span></div>
-            <div class="metric-box"><strong>{preview_unmatched}</strong><span>file(s) with no account</span></div>
+            <div class="metric-box"><strong>{len(_group_names)}</strong><span>combined PDF(s) to create</span></div>
+            <div class="metric-box"><strong>{n_in_folders}</strong><span>file(s) inside folders</span></div>
+            <div class="metric-box"><strong>{n_outside}</strong><span>outside file(s) (added to front)</span></div>
         </div>
         """,
         unsafe_allow_html=True,
