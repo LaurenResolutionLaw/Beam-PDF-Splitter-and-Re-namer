@@ -2435,7 +2435,7 @@ def build_account_final_pdfs(uploaded_files) -> tuple[bytes | None, list[dict], 
             page_count = merged.page_count
             if page_count > 0:
                 out_name = f"{account}final.pdf"
-                archive.writestr(f"{account}/{out_name}", merged.tobytes())
+                archive.writestr(out_name, merged.tobytes())
                 written += 1
                 status = "OK"
             else:
@@ -2484,8 +2484,8 @@ def render_file_combiner() -> None:
             "documents in date order.\n"
             "- PDFs are merged directly. Excel and image files are converted to PDF pages "
             "first. Anything that can't be converted is listed in the processing log.\n"
-            "- You get a single ZIP: one folder per account, each containing its "
-            "`<account>final.pdf`."
+            "- You get a single ZIP containing all the combined PDFs together in one "
+            "folder, each named `<account>final.pdf`."
         )
 
     st.markdown('<div class="section-label">Upload Files</div>', unsafe_allow_html=True)
