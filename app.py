@@ -2183,13 +2183,55 @@ def _spreadsheet_to_html_table(sheets, base_name: str, max_cols_per_block: int =
     return "".join(parts)
 
 
+REDACTION_TEXT = "[REDACTED]"
+# Formatted SSNs anywhere in a cell (123-45-6789 or 123 45 6789).
+_SSN_FORMATTED = re.compile(r"\b\d{3}[-\s]\d{2}[-\s]\d{4}\b")
+# Column-header cues for whole-column redaction.
+_SSN_HEADER = re.compile(r"(ssn|social\s*sec|soc\s*sec|\btin\b|tax\s*id)", re.I)
+_DOB_HEADER = re.compile(r"(date\s*of\s*birth|d\.?o\.?b\.?|birth\s*date|birthday|\bdob\b|\bbirth\b)", re.I)
+
+
+def _redact_sheets(sheets):
+    """Redact SSNs and dates of birth from spreadsheet rows before rendering.
+
+    - Any column whose HEADER looks like SSN or Date-of-Birth has every value
+      replaced with [REDACTED].
+    - Any cell anywhere containing a formatted SSN (123-45-6789 / 123 45 6789)
+      has that value replaced, even if the column is not labeled.
+    DOB is column-header driven on purpose, so ordinary dates (payment/posted
+    dates, etc.) are NOT touched. The redacted text never reaches the PDF."""
+    out = []
+    for title, rows in sheets:
+        if not rows:
+            out.append((title, rows))
+            continue
+        header = rows[0]
+        redact_cols = set()
+        for i, h in enumerate(header):
+            hs = str(h)
+            if _SSN_HEADER.search(hs) or _DOB_HEADER.search(hs):
+                redact_cols.add(i)
+        new_rows = [header]
+        for row in rows[1:]:
+            nr = []
+            for i, cell in enumerate(row):
+                cv = "" if cell is None else str(cell)
+                if i in redact_cols and cv.strip():
+                    cv = REDACTION_TEXT
+                elif cv:
+                    cv = _SSN_FORMATTED.sub(REDACTION_TEXT, cv)
+                nr.append(cv)
+            new_rows.append(nr)
+        out.append((title, new_rows))
+    return out
+
+
 def convert_spreadsheet_to_pdf_bytes(data: bytes, base_name: str) -> bytes | None:
-    """Spreadsheet -> PDF. LibreOffice first when available; otherwise render the
-    full cell data as a nicely formatted, bordered table (landscape, wrapping,
-    auto-paginated) so every value is included and nothing is cut off."""
-    via_office = convert_office_to_pdf_via_libreoffice(data, base_name)
-    if via_office is not None:
-        return via_office
+    """Spreadsheet -> PDF rendered as a nicely formatted, bordered table
+    (landscape, wrapping, auto-paginated) so every value is included and nothing
+    is cut off. SSNs and dates of birth are redacted from the data before the PDF
+    is built. (The spreadsheet always goes through this renderer, never an
+    external converter, so redaction is guaranteed.)"""
     ext = _file_extension(base_name)
     try:
         sheets = _read_spreadsheet_rows(data, ext)
@@ -2197,6 +2239,7 @@ def convert_spreadsheet_to_pdf_bytes(data: bytes, base_name: str) -> bytes | Non
         return None
     if not sheets:
         return None
+    sheets = _redact_sheets(sheets)
     table_pdf = _html_string_to_pdf_bytes(_spreadsheet_to_html_table(sheets, base_name), landscape=True)
     if table_pdf is not None:
         return table_pdf
@@ -2520,14 +2563,6 @@ def build_account_final_pdfs(uploaded_files) -> tuple[bytes | None, list[dict], 
                         if src.page_count == 0:
                             _add_placeholder(name, "Source PDF is empty or corrupt (0 pages) - included as a placeholder")
                         else:
-                            # Flatten interactive content (form fields + annotations) into
-                            # static page content before merging. Without this, widgets and
-                            # annotations carry into the combined PDF and some viewers (e.g.
-                            # Foxit) treat the result as locked / non-editable.
-                            try:
-                                src.bake(annots=True, widgets=True)
-                            except Exception as bake_exc:
-                                log.append(f"{group}: could not flatten {name} before merge ({bake_exc}); merged as-is")
                             merged.insert_pdf(src)
                             pdfs_merged += 1
                     finally:
