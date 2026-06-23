@@ -1,0 +1,11 @@
+__pycache__/
+.streamlit/secrets.toml
+.venv/
+venv/
+build/
+dist/
+*.spec
+*.exe
+*.lnk
+*.zip
+*.log

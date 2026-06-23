@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import hashlib
 import importlib.util
 import os
@@ -2734,6 +2735,539 @@ def render_file_combiner() -> None:
         )
 
 
+# ============================================================================
+# Document Sorter - Resolution Law Tools
+# Upload a folder (or batch) of files. The tool reads each file's NAME and, when
+# enabled, its CONTENTS (native PDF text, OCR for scans/images, text/Word/Excel),
+# then sorts each file into one of the legal document subfolders below. Matching
+# is semantic: it uses weighted keyword/synonym phrases plus fuzzy name matching,
+# so a file "called something similar" still lands in the right subfolder.
+# Output is a ZIP whose top-level folders are the subfolders, each holding the
+# files that belong to it, plus a "_sorting_report.csv" audit log. Every
+# suggestion can be overridden in the review table before the ZIP is built.
+# ============================================================================
+
+# Ordered most-specific -> least-specific. "Other" is the catch-all and is not
+# scored; it is used only when nothing else clears the confidence threshold.
+SORTER_CATEGORIES: list[dict] = [
+    {
+        "folder": "Redacted BOS",
+        "aliases": ["redacted bos", "redacted bill of sale", "bos redacted", "redacted bill-of-sale"],
+        "keywords": ["redacted bill of sale", "redacted bos", "bill of sale redacted", "redacted b.o.s", "bos (redacted)", "redacted"],
+    },
+    {
+        "folder": "Bill of Sale",
+        "aliases": ["bill of sale", "bos", "bill-of-sale", "asset bill of sale"],
+        "keywords": ["bill of sale", "b.o.s.", " bos ", "asset sale agreement", "purchase and sale agreement", "absolute assignment"],
+    },
+    {
+        "folder": "Affidavit of Indebtedness",
+        "aliases": ["affidavit of indebtedness", "affidavit of debt", "affidavit of account", "indebtedness affidavit", "affidavit of sum due"],
+        "keywords": ["affidavit of indebtedness", "affidavit of debt", "affidavit of account", "affidavit of sum", "being duly sworn", "indebtedness", "affiant", "sum certain"],
+    },
+    {
+        "folder": "Judgment Copy",
+        "aliases": ["judgment", "judgement", "judgment copy", "default judgment", "final judgment", "judgment order"],
+        "keywords": ["default judgment", "final judgment", "judgment is entered", "judgment in favor", "judgment copy", "judgment", "judgement", "writ of execution"],
+    },
+    {
+        "folder": "Charge-Off Statement",
+        "aliases": ["charge off statement", "chargeoff statement", "charge-off statement", "charge off", "charged off"],
+        "keywords": ["charge-off statement", "charge off statement", "charged off", "charge-off", "charge off", "chargeoff", "date of charge off", "charge-off balance"],
+    },
+    {
+        "folder": "Statement or Statement History",
+        "aliases": ["statement", "statement history", "monthly statement", "billing statement", "account statement", "statements"],
+        "keywords": ["statement history", "billing statement", "monthly statement", "account statement", "minimum payment due", "billing cycle", "previous balance", "new balance", "statement period", "closing date"],
+    },
+    {
+        "folder": "Payment History",
+        "aliases": ["payment history", "transaction history", "payment ledger", "account history", "payment log"],
+        "keywords": ["payment history", "transaction history", "payment ledger", "payments received", "payment posted", "transaction detail", "account activity", "ledger"],
+    },
+    {
+        "folder": "Terms and Conditions",
+        "aliases": ["terms and conditions", "cardholder agreement", "t&c", "terms & conditions", "credit card agreement", "terms of use"],
+        "keywords": ["terms and conditions", "terms & conditions", "cardholder agreement", "credit card agreement", "card agreement", "governing law", "arbitration provision", "t&c", "agreement and disclosure"],
+    },
+    {
+        "folder": "Consumer Notice of Account Transfer",
+        "aliases": ["notice of account transfer", "notice of assignment", "consumer notice of account transfer", "account transfer notice", "notice of sale of account", "notice of transfer"],
+        "keywords": ["notice of account transfer", "notice of assignment", "your account has been transferred", "account was sold", "account has been sold", "transfer of your account", "new creditor", "ownership of your account"],
+    },
+    {
+        "folder": "Power of Attorney",
+        "aliases": ["power of attorney", "poa", "limited power of attorney", "special power of attorney"],
+        "keywords": ["power of attorney", "attorney-in-fact", "attorney in fact", "limited power of attorney", "hereby appoint", "poa"],
+    },
+    {
+        "folder": "Cease and Desist Request",
+        "aliases": ["cease and desist", "cease and desist request", "c&d", "cease & desist", "stop contact request"],
+        "keywords": ["cease and desist", "cease & desist", "stop contacting me", "do not contact", "cease all communication", "c&d", "stop all communication"],
+    },
+    {
+        "folder": "Validation Request",
+        "aliases": ["validation request", "debt validation", "validation of debt", "verification request", "request for validation"],
+        "keywords": ["debt validation", "validation of debt", "validate this debt", "verification of the debt", "request validation", "1692g", "fdcpa validation", "verify the debt"],
+    },
+    {
+        "folder": "Dispute",
+        "aliases": ["dispute", "dispute letter", "consumer dispute", "account dispute", "disputed"],
+        "keywords": ["dispute this debt", "i dispute", "disputed account", "dispute letter", "this account is disputed", "i am disputing", "dispute"],
+    },
+    {
+        "folder": "Complaint",
+        "aliases": ["complaint", "civil complaint", "petition", "summons and complaint", "verified complaint"],
+        "keywords": ["civil complaint", "verified complaint", "plaintiff alleges", "comes now the plaintiff", "cause of action", "complaint", "petition", "wherefore plaintiff"],
+    },
+    {
+        "folder": "Answer - Partial Admission",
+        "aliases": ["answer partial admission", "partial admission", "answer - partial admission", "partial admit answer"],
+        "keywords": ["partial admission", "admit in part and deny in part", "admits in part", "admitted in part", "partially admit", "admit in part"],
+    },
+    {
+        "folder": "Answer - Admitted",
+        "aliases": ["answer admitted", "answer - admitted", "admission", "answer admit", "admitted answer"],
+        "keywords": ["defendant admits", "admits the allegations", "admitted", "answer admitting", "hereby admits", "admission of"],
+    },
+    {
+        "folder": "Answer - Denial",
+        "aliases": ["answer denial", "answer - denial", "answer denying", "denial answer", "general denial"],
+        "keywords": ["general denial", "defendant denies", "denies the allegations", "denied", "answer and denial", "hereby denies", "denial of"],
+    },
+    {
+        "folder": "Bankruptcy",
+        "aliases": ["bankruptcy", "chapter 7", "chapter 13", "bankruptcy notice", "bk", "discharge"],
+        "keywords": ["bankruptcy", "chapter 7", "chapter 13", "chapter 11", "automatic stay", "341 meeting", "order of discharge", "proof of claim", "bankruptcy court", "petition for bankruptcy", "trustee"],
+    },
+    {
+        "folder": "Recorded Lien",
+        "aliases": ["recorded lien", "lien", "ucc lien", "lien filing", "recorded judgment lien", "abstract of judgment"],
+        "keywords": ["recorded lien", "judgment lien", "ucc financing statement", "ucc-1", "abstract of judgment", "lien recorded", "notice of lien", "lien on", "recorder of deeds"],
+    },
+    {
+        "folder": "Repo Docs",
+        "aliases": ["repo docs", "repossession", "repo", "repossession docs", "condition report", "vehicle repossession"],
+        "keywords": ["repossession", "repossessed", "notice of repossession", "right to cure", "redemption notice", "condition report", "vehicle", "vin", "auction notice", "deficiency balance", "repo"],
+    },
+    {
+        "folder": "Origination",
+        "aliases": ["origination", "application", "credit application", "loan agreement", "account origination", "original note", "promissory note", "originating documents"],
+        "keywords": ["credit application", "application for credit", "origination", "loan agreement", "promissory note", "original creditor", "account opening", "applicant signature", "retail installment", "note and security agreement"],
+    },
+    {
+        "folder": "Title",
+        "aliases": ["title", "certificate of title", "car title", "vehicle title", "lien title"],
+        "keywords": ["certificate of title", "vehicle title", "title number", "certificate of ownership", "lienholder", "dmv title", "branded title"],
+    },
+    {
+        "folder": "Check",
+        "aliases": ["check", "cancelled check", "canceled check", "payment check", "cleared check", "check copy"],
+        "keywords": ["cancelled check", "canceled check", "cleared check", "check number", "pay to the order of", "voided check", "check image", "routing number", "memo line"],
+    },
+    {
+        "folder": "Exhibit",
+        "aliases": ["exhibit", "exhibit a", "exhibit b", "exhibit 1", "ex a", "attachment exhibit"],
+        "keywords": ["exhibit a", "exhibit b", "exhibit c", "exhibit 1", "see exhibit", "attached exhibit", "exhibit"],
+    },
+    {
+        "folder": "Legal",
+        "aliases": ["legal", "pleading", "motion", "court filing", "order", "notice of appearance", "stipulation", "subpoena"],
+        "keywords": ["motion to", "notice of hearing", "notice of appearance", "stipulation", "subpoena", "discovery", "interrogatories", "request for production", "certificate of service", "proposed order", "memorandum of law", "pleading", "in the circuit court", "in the district court"],
+    },
+    {
+        "folder": "Correspondence",
+        "aliases": ["correspondence", "letter", "email", "demand letter", "collection letter", "notice letter", "memo"],
+        "keywords": ["dear sir", "dear madam", "to whom it may concern", "sincerely", "demand letter", "collection letter", "please be advised", "this letter", "from:", "subject:", "correspondence", "re:"],
+    },
+]
+
+SORTER_OTHER_FOLDER = "Other"
+SORTER_FOLDER_NAMES = [c["folder"] for c in SORTER_CATEGORIES] + [SORTER_OTHER_FOLDER]
+SORTER_MIN_SCORE = 4.0          # below this -> Other (Needs Review)
+SORTER_CONTENT_CHAR_LIMIT = 6000
+SORTER_CONTENT_PAGE_LIMIT = 4
+_SORTER_NONALNUM = re.compile(r"[^a-z0-9]+")
+
+
+def _sorter_norm(text: str) -> str:
+    """Lowercase and collapse non-alphanumerics to single spaces for matching."""
+    return _SORTER_NONALNUM.sub(" ", (text or "").lower()).strip()
+
+
+def _sorter_phrase_weight(phrase: str) -> float:
+    """More words in a matched phrase = more specific = higher weight."""
+    words = len(_sorter_norm(phrase).split())
+    return {0: 0.0, 1: 1.0, 2: 3.0, 3: 6.0}.get(words, 9.0)
+
+
+def sorter_extract_text(base_name: str, data: bytes, use_ocr: bool) -> str:
+    """Best-effort text from a single file for classification. Never raises."""
+    ext = _file_extension(base_name)
+    text = ""
+    try:
+        if ext in DOCBUILD_PDF_EXTS:
+            doc = fitz.open(stream=data, filetype="pdf")
+            try:
+                parts: list[str] = []
+                native_chars = 0
+                for page in doc[: SORTER_CONTENT_PAGE_LIMIT]:
+                    page_text = page.get_text("text") or ""
+                    native_chars += len(page_text.strip())
+                    parts.append(page_text)
+                text = "\n".join(parts)
+                if native_chars < 40 and use_ocr and ocr_available():
+                    text = sorter_ocr_pdf(doc) or text
+            finally:
+                doc.close()
+        elif ext in DOCBUILD_IMAGE_EXTS:
+            if use_ocr and ocr_available():
+                text = sorter_ocr_image_bytes(data) or ""
+        elif ext in DOCBUILD_WORD_EXTS:
+            text = sorter_text_from_word(data)
+        elif ext in DOCBUILD_EXCEL_EXTS:
+            text = sorter_text_from_excel(data)
+        elif ext in {"txt", "csv", "tsv", "md", "rtf"}:
+            text = data.decode("utf-8", "ignore")
+        elif ext in DOCBUILD_HTML_EXTS:
+            raw = data.decode("utf-8", "ignore")
+            text = re.sub(r"<[^>]+>", " ", raw)
+    except Exception:
+        text = ""
+    return (text or "")[:SORTER_CONTENT_CHAR_LIMIT]
+
+
+def sorter_ocr_pdf(doc) -> str:
+    try:
+        from PIL import Image, ImageOps
+        import pytesseract
+
+        configure_tesseract(pytesseract)
+        parts: list[str] = []
+        for page in doc[: min(2, len(doc))]:
+            matrix = fitz.Matrix(2, 2)
+            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+            image = Image.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples)
+            image = ImageOps.autocontrast(ImageOps.grayscale(image))
+            parts.append(pytesseract.image_to_string(image, config="--psm 6") or "")
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
+
+def sorter_ocr_image_bytes(data: bytes) -> str:
+    try:
+        from PIL import Image, ImageOps
+        import pytesseract
+
+        configure_tesseract(pytesseract)
+        image = Image.open(BytesIO(data))
+        image = ImageOps.autocontrast(ImageOps.grayscale(image.convert("RGB")))
+        return pytesseract.image_to_string(image, config="--psm 6") or ""
+    except Exception:
+        return ""
+
+
+def sorter_text_from_word(data: bytes) -> str:
+    try:
+        import mammoth
+
+        result = mammoth.extract_raw_text(BytesIO(data))
+        return result.value or ""
+    except Exception:
+        return ""
+
+
+def sorter_text_from_excel(data: bytes) -> str:
+    try:
+        sheet_name, headers, records = _read_xlsx_bytes(data)
+        parts = [sheet_name] + list(headers)
+        for rec in records[:60]:
+            parts.extend(str(v) for v in rec.values())
+        return " ".join(parts)
+    except Exception:
+        try:
+            return data.decode("utf-8", "ignore")
+        except Exception:
+            return ""
+
+
+def classify_document(name_text: str, content_text: str) -> tuple[str, float, list[str]]:
+    """Score every category against the file name + contents and return
+    (folder, confidence_score, matched_terms). Falls back to Other below
+    SORTER_MIN_SCORE."""
+    name_norm = " " + _sorter_norm(name_text) + " "
+    content_norm = " " + _sorter_norm(content_text) + " "
+    name_stem = _sorter_norm(Path(name_text.split(" > ")[-1]).stem)
+
+    best_folder = SORTER_OTHER_FOLDER
+    best_score = 0.0
+    best_terms: list[str] = []
+
+    for cat in SORTER_CATEGORIES:
+        score = 0.0
+        terms: list[str] = []
+        for phrase in cat["keywords"]:
+            pn = _sorter_norm(phrase)
+            if not pn:
+                continue
+            weight = _sorter_phrase_weight(phrase)
+            if (" " + pn + " ") in name_norm:
+                score += weight * 3.0          # filename hit is strongest
+                terms.append(f"name:{phrase}")
+            elif (" " + pn + " ") in content_norm:
+                score += weight * 1.0          # content hit
+                terms.append(f"text:{phrase}")
+        # Fuzzy filename-vs-alias match catches "called something similar"
+        fuzzy = 0.0
+        for alias in cat["aliases"]:
+            ratio = difflib.SequenceMatcher(None, name_stem, _sorter_norm(alias)).ratio()
+            fuzzy = max(fuzzy, ratio)
+        if fuzzy >= 0.85:
+            score += 7.0
+            terms.append(f"name~{fuzzy:.0%}")
+        elif fuzzy >= 0.65:
+            score += 3.0
+            terms.append(f"name~{fuzzy:.0%}")
+        if score > best_score:
+            best_score, best_folder, best_terms = score, cat["folder"], terms
+
+    if best_score < SORTER_MIN_SCORE:
+        return SORTER_OTHER_FOLDER, best_score, best_terms
+    return best_folder, best_score, best_terms
+
+
+def sorter_confidence_label(score: float, folder: str) -> str:
+    if folder == SORTER_OTHER_FOLDER:
+        return "Needs review"
+    if score >= 12:
+        return "High"
+    if score >= 7:
+        return "Medium"
+    return "Low"
+
+
+def sorter_analyze(uploaded_files, read_contents: bool, use_ocr: bool) -> tuple[list[dict], dict[str, bytes]]:
+    """Expand archives, classify each file, return review rows + raw bytes by key."""
+    rows: list[dict] = []
+    file_bytes: dict[str, bytes] = {}
+    seen = 0
+    for uploaded in uploaded_files:
+        raw_name = uploaded.name
+        try:
+            data = uploaded.getvalue()
+        except Exception:
+            continue
+        for member_name, member_data in _expand_uploads(raw_name, data):
+            seen += 1
+            key = f"sorter::{seen}"
+            file_bytes[key] = member_data
+            display_name = member_name.replace("\\", "/").split("/")[-1]
+            content = sorter_extract_text(member_name, member_data, use_ocr) if read_contents else ""
+            folder, score, terms = classify_document(member_name, content)
+            rows.append(
+                {
+                    "key": key,
+                    "include": True,
+                    "File": display_name,
+                    "Folder": folder,
+                    "Confidence": sorter_confidence_label(score, folder),
+                    "Why": ", ".join(terms[:6]) if terms else "no strong match",
+                    "_score": round(score, 1),
+                    "_source": member_name,
+                }
+            )
+    return rows, file_bytes
+
+
+def build_sorted_zip(rows: list[dict], file_bytes: dict[str, bytes]) -> tuple[bytes | None, list[str]]:
+    errors: list[str] = []
+    output = BytesIO()
+    used_by_folder: dict[str, set[str]] = {}
+    written = 0
+    report = ["File,Folder,Confidence,Score,Source,Why"]
+
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for row in rows:
+            if not row.get("include"):
+                continue
+            data = file_bytes.get(row["key"])
+            if data is None:
+                errors.append(f"{row['File']}: file data was not found.")
+                continue
+            folder = str(row.get("Folder") or SORTER_OTHER_FOLDER).strip() or SORTER_OTHER_FOLDER
+            safe_folder = INVALID_FILENAME_CHARS.sub("_", folder).strip(" .") or SORTER_OTHER_FOLDER
+            original = INVALID_FILENAME_CHARS.sub("_", str(row["File"])).strip(" .") or "file"
+            used = used_by_folder.setdefault(safe_folder, set())
+            candidate = original
+            stem, dot, ext = original.rpartition(".")
+            counter = 2
+            while candidate.lower() in used:
+                if dot:
+                    candidate = f"{stem}_{counter:02d}.{ext}"
+                else:
+                    candidate = f"{original}_{counter:02d}"
+                counter += 1
+            used.add(candidate.lower())
+            archive.writestr(f"Sorted Documents/{safe_folder}/{candidate}", data)
+            written += 1
+
+            def _csv(v: str) -> str:
+                v = str(v).replace('"', '""')
+                return f'"{v}"' if ("," in v or '"' in v) else v
+
+            report.append(
+                ",".join(
+                    _csv(x)
+                    for x in [
+                        candidate,
+                        safe_folder,
+                        row.get("Confidence", ""),
+                        row.get("_score", ""),
+                        row.get("_source", ""),
+                        row.get("Why", ""),
+                    ]
+                )
+            )
+
+        if written == 0:
+            return None, ["No files were selected. Check at least one row to include."]
+        archive.writestr("Sorted Documents/_sorting_report.csv", "\n".join(report))
+
+    return output.getvalue(), errors
+
+
+def render_document_sorter() -> None:
+    st.header("Document Sorter")
+    st.write(
+        "Upload a folder of files and the tool sorts each one into the correct "
+        "legal subfolder. It reads both the file name and (optionally) what is "
+        "inside each file, matching on meaning - so a document named something "
+        "similar still lands in the right place. Review and adjust the suggestions, "
+        "then download a ZIP organized into subfolders."
+    )
+
+    with st.expander("How it works", expanded=False):
+        st.markdown(
+            "1. Upload a whole folder (or a batch of files / a .zip).\n"
+            "2. The tool classifies every file into one of these folders:\n"
+            f"   {', '.join(SORTER_FOLDER_NAMES)}.\n"
+            "3. Matching uses weighted keyword and synonym phrases plus fuzzy "
+            "name matching, scored against the file name (strongest) and the "
+            "file's text.\n"
+            "4. Anything it cannot confidently place goes to **Other** and is "
+            "flagged *Needs review*.\n"
+            "5. Override any **Folder** in the table, then build the ZIP. A "
+            "`_sorting_report.csv` audit log is included."
+        )
+
+    ocr_ready = ocr_available()
+    col_a, col_b = st.columns(2)
+    with col_a:
+        read_contents = st.checkbox(
+            "Read inside files (more accurate, slower)",
+            value=True,
+            key="sorter_read_contents",
+        )
+    with col_b:
+        use_ocr = st.checkbox(
+            "Use OCR for scanned PDFs and images",
+            value=ocr_ready,
+            disabled=not ocr_ready,
+            help=None if ocr_ready else "Tesseract OCR is not available in this environment.",
+            key="sorter_use_ocr",
+        )
+
+    upload_tabs = st.tabs(["Folder of files", "Single or multiple files"])
+    with upload_tabs[0]:
+        folder_uploads = st.file_uploader(
+            "Choose a folder",
+            accept_multiple_files="directory",
+            help="Uploads every file in the folder at once.",
+            key="sorter_folder_uploads",
+        )
+    with upload_tabs[1]:
+        file_uploads = st.file_uploader(
+            "Choose one file or several files (.zip is expanded automatically)",
+            accept_multiple_files=True,
+            key="sorter_file_uploads",
+        )
+
+    uploaded_files = list(folder_uploads or []) + list(file_uploads or [])
+    if not uploaded_files:
+        st.info("Upload a folder or files to begin.")
+        return
+
+    signature = uploaded_files_signature(uploaded_files)
+    settings_sig = f"{signature}|{read_contents}|{use_ocr}"
+    if st.session_state.get("sorter_settings_sig") != settings_sig:
+        with st.spinner("Reading and classifying files..."):
+            rows, file_bytes = sorter_analyze(uploaded_files, read_contents, use_ocr)
+        st.session_state["sorter_settings_sig"] = settings_sig
+        st.session_state["sorter_rows"] = rows
+        st.session_state["sorter_file_bytes"] = file_bytes
+        st.session_state["sorter_zip_bytes"] = None
+
+    rows = st.session_state.get("sorter_rows", [])
+    file_bytes = st.session_state.get("sorter_file_bytes", {})
+    if not rows:
+        st.warning("No files could be read from the upload.")
+        return
+
+    needs_review = sum(1 for r in rows if r["Folder"] == SORTER_OTHER_FOLDER)
+    folders_used = len({r["Folder"] for r in rows})
+    st.markdown(
+        f"""
+        <div class="metric-strip">
+            <div class="metric-box"><strong>{len(rows)}</strong><span>file(s)</span></div>
+            <div class="metric-box"><strong>{folders_used}</strong><span>folder(s) used</span></div>
+            <div class="metric-box"><strong>{needs_review}</strong><span>need review</span></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.subheader("Review and adjust")
+    st.caption("Change any Folder before building the ZIP. Uncheck Include to skip a file.")
+    edited = st.data_editor(
+        rows,
+        key="sorter_editor",
+        use_container_width=True,
+        hide_index=True,
+        column_order=["include", "File", "Folder", "Confidence", "Why"],
+        column_config={
+            "include": st.column_config.CheckboxColumn("Include", default=True),
+            "File": st.column_config.TextColumn("File", disabled=True),
+            "Folder": st.column_config.SelectboxColumn("Folder", options=SORTER_FOLDER_NAMES, required=True),
+            "Confidence": st.column_config.TextColumn("Confidence", disabled=True),
+            "Why": st.column_config.TextColumn("Matched on", disabled=True),
+            "key": None,
+            "_score": None,
+            "_source": None,
+        },
+    )
+
+    if st.button("Build Sorted ZIP", type="primary", use_container_width=True):
+        zip_bytes, errors = build_sorted_zip(edited, file_bytes)
+        st.session_state["sorter_zip_bytes"] = zip_bytes
+        for err in errors:
+            st.warning(err)
+        if zip_bytes is None and not errors:
+            st.error("Could not build the ZIP.")
+
+    if st.session_state.get("sorter_zip_bytes"):
+        st.success("Your sorted folders are ready.")
+        st.download_button(
+            "Download Sorted Documents (ZIP)",
+            data=st.session_state["sorter_zip_bytes"],
+            file_name="sorted_documents.zip",
+            mime="application/zip",
+            type="primary",
+            use_container_width=True,
+        )
+
+
+
 def get_tools() -> list[ToolDefinition]:
     return [
         ToolDefinition(
@@ -2770,6 +3304,13 @@ def get_tools() -> list[ToolDefinition]:
             category="Documents",
             description="Upload a file or a whole folder and download a spreadsheet listing every file name, type, and size.",
             render=render_file_name_lister,
+        ),
+        ToolDefinition(
+            tool_id="document-sorter",
+            name="Document Sorter",
+            category="Documents",
+            description="Sort a folder of files into legal subfolders (Origination, Bill of Sale, Bankruptcy, Judgment Copy, etc.) by reading file names and contents. Review the suggestions, then download a ZIP organized into subfolders.",
+            render=render_document_sorter,
         ),
     ]
 
