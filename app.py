@@ -2482,6 +2482,43 @@ def _group_uploads(uploaded_files):
     return inside, front, group_names
 
 
+def _strip_document_permission_restrictions(doc) -> bool:
+    """Remove a carried-over digital-signature/certification permission lock
+    (the PDF catalog's /Perms entry, e.g. DocMDP "no changes allowed" or
+    "form fill-in only") from a merged document.
+
+    Some source PDFs (e-signed complaints, notarized affidavits, DocuSign /
+    Adobe Sign certificates, etc.) are digitally *certified*: the signing tool
+    writes a /Perms /DocMDP dictionary into that PDF's Root catalog which
+    tells compliant viewers like Acrobat "no further edits are allowed to
+    this document." When pages from a certified PDF are merged into a new
+    combined PDF, PyMuPDF's page-level graft can carry that same /Perms
+    reference into the merged file's own catalog - so the ENTIRE combined
+    PDF (every account's pages, not just the signed one) shows up locked /
+    not editable in Acrobat, even though the merge broke the signature's
+    byte-range validity anyway and the restriction no longer serves any
+    real security purpose. Clearing /Perms on the merged catalog removes
+    that inherited restriction so the combined PDF is editable again.
+    Returns True if a restriction was found and removed."""
+    try:
+        catalog_xref = doc.pdf_catalog()
+    except Exception:
+        return False
+    if catalog_xref <= 0:
+        return False
+    try:
+        existing = doc.xref_get_key(catalog_xref, "Perms")
+    except Exception:
+        existing = ("null", "null")
+    if not existing or existing[0] == "null":
+        return False
+    try:
+        doc.xref_set_key(catalog_xref, "Perms", "null")
+        return True
+    except Exception:
+        return False
+
+
 def build_account_final_pdfs(uploaded_files) -> tuple[bytes | None, list[dict], list[str], list[str]]:
     """Build one combined PDF per sub-folder.
 
@@ -2561,7 +2598,9 @@ def build_account_final_pdfs(uploaded_files) -> tuple[bytes | None, list[dict], 
                 try:
                     src = fitz.open(stream=pdf_bytes, filetype="pdf")
                     try:
-                        if src.page_count == 0:
+                        if src.needs_pass and not src.authenticate(""):
+                            _add_placeholder(name, "Source PDF is password-protected - included as a placeholder")
+                        elif src.page_count == 0:
                             _add_placeholder(name, "Source PDF is empty or corrupt (0 pages) - included as a placeholder")
                         else:
                             merged.insert_pdf(src)
@@ -2573,8 +2612,18 @@ def build_account_final_pdfs(uploaded_files) -> tuple[bytes | None, list[dict], 
 
             page_count = merged.page_count
             if page_count > 0:
+                # Drop any inherited signature/certification permission lock so the
+                # combined PDF is never non-editable because ONE source file was
+                # certified/signed. See _strip_document_permission_restrictions().
+                if _strip_document_permission_restrictions(merged):
+                    log.append(
+                        f"{group}: removed an inherited signature/certification permission "
+                        "lock so the combined PDF is fully editable."
+                    )
                 out_name = f"{group}final.pdf"
-                archive.writestr(out_name, merged.tobytes())
+                out_buffer = BytesIO()
+                merged.save(out_buffer, garbage=4, deflate=True, encryption=fitz.PDF_ENCRYPT_NONE)
+                archive.writestr(out_name, out_buffer.getvalue())
                 written += 1
                 status = "OK"
             else:
