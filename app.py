@@ -2519,6 +2519,97 @@ def _strip_document_permission_restrictions(doc) -> bool:
         return False
 
 
+def _pikepdf_available() -> bool:
+    return importlib.util.find_spec("pikepdf") is not None
+
+
+def _sanitize_merged_pdf_bytes(pdf_bytes: bytes) -> tuple[bytes, int]:
+    """Strip leftover digital-signature fields and the AcroForm 'append-only'
+    signature lock from a just-merged PDF. Returns (possibly-rewritten bytes,
+    signature_fields_removed).
+
+    Real-world cause confirmed against an actual combined output file: each
+    source document that had already been signed (e.g. through an e-signature
+    platform) contributes its own Signature field to the merged file's shared
+    AcroForm. Those signature fields are unavoidably broken by the merge (their
+    byte-range hash no longer matches), but two things survive intact and are
+    what actually lock the file in Acrobat:
+      1. AcroForm /SigFlags gets its AppendOnly bit (2) set, which tells any
+         PDF-1.7-conforming reader "this document must only be changed via
+         incremental updates from now on" - i.e. no normal editing.
+      2. The broken signature field objects themselves remain in the merged
+         AcroForm /Fields array and as page /Annots widgets, which is what
+         triggers Acrobat's "at least one signature is invalid" / restricted
+         editing state.
+    Removing the signature fields (both from AcroForm/Fields and from each
+    page's /Annots) and clearing /SigFlags removes that lock. If the AcroForm
+    ends up with no fields left, it is dropped entirely.
+
+    Requires the optional 'pikepdf' package. If it isn't installed, the bytes
+    are returned unchanged (the fitz-level /Perms strip in
+    _strip_document_permission_restrictions still runs as a first line of
+    defense, but installing pikepdf is recommended for the full fix)."""
+    if not _pikepdf_available():
+        return pdf_bytes, 0
+
+    import pikepdf
+
+    try:
+        pdf = pikepdf.open(BytesIO(pdf_bytes))
+    except Exception:
+        return pdf_bytes, 0
+
+    try:
+        root = pdf.Root
+        if "/Perms" in root:
+            del root.Perms
+
+        if "/AcroForm" not in root:
+            buf = BytesIO()
+            pdf.save(buf)
+            return buf.getvalue(), 0
+
+        acroform = root.AcroForm
+
+        def _is_sig_field(field_obj) -> bool:
+            try:
+                return str(field_obj.get("/FT")) == "/Sig"
+            except Exception:
+                return False
+
+        fields = acroform.get("/Fields")
+        sig_count = 0
+        if fields is not None:
+            kept = []
+            for field in fields:
+                if _is_sig_field(field):
+                    sig_count += 1
+                else:
+                    kept.append(field)
+            acroform.Fields = pikepdf.Array(kept)
+
+        if sig_count:
+            for page in pdf.pages:
+                if "/Annots" not in page:
+                    continue
+                kept_annots = [a for a in page.Annots if not _is_sig_field(a)]
+                page.Annots = pikepdf.Array(kept_annots)
+
+        if "/SigFlags" in acroform:
+            del acroform.SigFlags
+
+        if not acroform.get("/Fields"):
+            del root.AcroForm
+
+        buf = BytesIO()
+        pdf.save(buf)
+        return buf.getvalue(), sig_count
+    except Exception:
+        return pdf_bytes, 0
+    finally:
+        pdf.close()
+
+
 def build_account_final_pdfs(uploaded_files) -> tuple[bytes | None, list[dict], list[str], list[str]]:
     """Build one combined PDF per sub-folder.
 
@@ -2623,7 +2714,19 @@ def build_account_final_pdfs(uploaded_files) -> tuple[bytes | None, list[dict], 
                 out_name = f"{group}final.pdf"
                 out_buffer = BytesIO()
                 merged.save(out_buffer, garbage=4, deflate=True, encryption=fitz.PDF_ENCRYPT_NONE)
-                archive.writestr(out_name, out_buffer.getvalue())
+                final_bytes, sig_fields_removed = _sanitize_merged_pdf_bytes(out_buffer.getvalue())
+                if sig_fields_removed:
+                    log.append(
+                        f"{group}: removed {sig_fields_removed} leftover signature field(s) and "
+                        "cleared the append-only signature lock so the combined PDF is fully editable."
+                    )
+                elif not _pikepdf_available():
+                    log.append(
+                        f"{group}: 'pikepdf' is not installed on this server, so leftover signature "
+                        "fields from already-signed source documents could not be fully cleaned up. "
+                        "Install it with 'pip install pikepdf' for the complete fix."
+                    )
+                archive.writestr(out_name, final_bytes)
                 written += 1
                 status = "OK"
             else:
